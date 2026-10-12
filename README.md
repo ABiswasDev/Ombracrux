@@ -9,14 +9,17 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ABiswasDev/Ombracrux/releases"><img src="https://img.shields.io/badge/Release-v0.1.0-007acc?style=for-the-badge" alt="Release"></a>
-  <img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-2d2d2d?style=for-the-badge" alt="Platform">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-28a745?style=for-the-badge" alt="License"></a>
+  <img src="https://img.shields.io/badge/PLATFORM-WINDOWS%20%7C%20MACOS%20%7C%20LINUX-2d2d2d?style=for-the-badge" alt="Platform">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/LICENSE-AGPL--3.0-28a745?style=for-the-badge" alt="License"></a>
 </p>
 
 ## Overview & Features
 
 Ombracrux is a network-isolated, cross-platform graphical application for Horcrux-style threshold secret sharing. It utilizes Shamir's Secret Sharing (SSSS) alongside post-quantum resilient stream ciphers to shatter sensitive files and directories into distributed cryptographic shares (`.ombracrx`). A user-defined threshold of these shares must be combined to reconstruct the original data, ensuring absolute data privacy and preventing a single point of failure without relying on external infrastructure or cloud services.
+
+<p align="center">
+  <img src="images/screenshot.png" alt="Ombracrux Interface" width="450">
+</p>
 
 * **Cross-Platform:** Native installers generated via automated CI/CD for Linux, Windows, and macOS.
 * **Network-Isolated Execution:** No telemetry, no cloud accounts, and no internet connection required.
