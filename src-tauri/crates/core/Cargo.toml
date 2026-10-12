@@ -1,0 +1,12 @@
+[package]
+name = "ombracrux-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+sharks = "0.5"
+zeroize = { version = "1.7", features = ["zeroize_derive"] }
+thiserror = "1.0"
+anyhow = "1.0"
+rand = "0.8"
