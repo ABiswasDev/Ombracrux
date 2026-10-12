@@ -51,4 +51,4 @@ jobs:
           releaseName: 'Ombracrux ${{ github.ref_name }}'
           releaseBody: 'Automated release build for Ombracrux. Download the installer for your platform below.'
           releaseDraft: false
-          prerelease: true
+          prerelease: false
