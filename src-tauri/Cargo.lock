@@ -2425,6 +2425,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ombracrux"
+version = "0.1.0"
+dependencies = [
+ "ombracrux-core",
+ "serde",
+ "serde_json",
+ "tar",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+]
+
+[[package]]
 name = "ombracrux-core"
 version = "0.1.0"
 dependencies = [
@@ -3617,20 +3631,6 @@ dependencies = [
  "webview2-com",
  "window-vibrancy",
  "windows",
-]
-
-[[package]]
-name = "tauri-app"
-version = "0.1.0"
-dependencies = [
- "ombracrux-core",
- "serde",
- "serde_json",
- "tar",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-opener",
 ]
 
 [[package]]

@@ -1,12 +1,12 @@
 [package]
-name = "tauri-app"
+name = "ombracrux"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Post-Quantum Resilient Threshold Storage"
+authors = ["Abhishek Biswas"]
 edition = "2024"
 
 [lib]
-name = "tauri_app_lib"
+name = "ombracrux_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
