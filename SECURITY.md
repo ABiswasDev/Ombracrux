@@ -21,6 +21,6 @@ Report vulnerabilities, memory leaks, or cryptographic bypasses privately:
 
 ## Response Protocol
 
-1.  **Acknowledgment:** We will confirm receipt privately within 72 hours.
+1.  **Acknowledgment:** We will confirm receipt privately ASAP.
 2.  **Patching:** If validated, an expedited security patch will be engineered.
 3.  **Attribution:** With your explicit consent, you will be formally credited in the release notes for responsible disclosure.
