@@ -3,3 +3,4 @@ pub mod format;
 pub mod restore;
 pub mod shares;
 pub mod split;
+pub mod archive;

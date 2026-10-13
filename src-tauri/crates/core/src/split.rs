@@ -1,75 +1,59 @@
 use anyhow::{anyhow, Result};
-use rand::RngCore;
-use std::io::{Read, Write};
+use rand::{rngs::OsRng, RngCore};
+use std::path::Path;
 
-use crate::crypto::{encrypt_stream, generate_key, generate_nonce};
-use crate::format::ShareHeader;
+use crate::archive::stream_directory_to_memory;
+use crate::crypto::encrypt_pipeline;
+use crate::format::{ShareHeader, FORMAT_VERSION, MAGIC_BYTES};
 use crate::shares::split_key;
 
-/// A simple utility to write identical data to multiple streams simultaneously.
-struct MultiWriter<'a, W: Write> {
-    writers: &'a mut [W],
-}
-
-impl<'a, W: Write> Write for MultiWriter<'a, W> {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        for writer in self.writers.iter_mut() {
-            writer.write_all(buf)?;
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        for writer in self.writers.iter_mut() {
-            writer.flush()?;
-        }
-        Ok(())
-    }
-}
-
-/// Splits an input stream into multiple encrypted share streams.
-pub fn split_file<R: Read, W: Write>(
-    mut input: R,
-    mut outputs: Vec<W>,
+/// Splits a directory into multiple encrypted share files using Shamir's Secret Sharing
+/// and a bounded zero-RAM streaming pipeline.
+pub fn split_directory<W: std::io::Write>(
+    src_dir: &Path,
+    mut output_files: Vec<W>,
     threshold: u8,
     total_shares: u8,
 ) -> Result<()> {
-    if outputs.len() != total_shares as usize {
-        return Err(anyhow!("Number of output streams must match total_shares"));
+    if output_files.len() != total_shares as usize {
+        return Err(anyhow!("Number of output files must match total_shares"));
     }
 
-    // 1. Generate cryptographic material
-    let key = generate_key();
-    let nonce = generate_nonce();
-    
+    // 1. Generate cryptographic material securely
+    let mut master_key = [0u8; 32];
+    OsRng.fill_bytes(&mut master_key);
+
     let mut bundle_id = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bundle_id);
+    OsRng.fill_bytes(&mut bundle_id);
 
-    let mut header = ShareHeader::new(threshold, total_shares);
-    header.bundle_id = bundle_id;
+    let mut base_nonce_prefix = [0u8; 16];
+    OsRng.fill_bytes(&mut base_nonce_prefix);
 
-    // 2. Split the encryption key
-    let key_shares = split_key(&key, threshold, total_shares)?;
+    // 2. Split the master encryption key using SSSS
+    let key_shares = split_key(&master_key, threshold, total_shares)?;
 
-    // 3. Write individual headers, unique key shares, and the shared nonce to each output
-    for (i, writer) in outputs.iter_mut().enumerate() {
-        let share_bytes = &key_shares[i];
+    // 3. Write individual V2 headers and unique key shares to each file
+    for (i, file) in output_files.iter_mut().enumerate() {
+        let header = ShareHeader {
+            magic: *MAGIC_BYTES,
+            version: FORMAT_VERSION,
+            bundle_id,
+            total_shares,
+            threshold,
+            share_index: (i + 1) as u8,
+            base_nonce_prefix,
+            ssss_share_data: key_shares[i].clone(),
+        };
         
-        // Write 27-byte header
-        writer.write_all(&header.to_bytes())?;
-        
-        // Write share length (2 bytes, little-endian) and the actual share payload
-        let share_len = share_bytes.len() as u16;
-        writer.write_all(&share_len.to_le_bytes())?;
-        writer.write_all(share_bytes)?;
-        
-        // Write 24-byte AEAD nonce
-        writer.write_all(&nonce)?;
+        header.write_to(&mut *file)?;
     }
 
-    // 4. Stream the input file, encrypt it exactly once, and write simultaneously to all outputs
-    let multi_writer = MultiWriter { writers: &mut outputs };
-    encrypt_stream(&mut input, multi_writer, &key, &nonce)?;
+    // 4. Start the bounded in-memory archiver (1 MB chunks)
+    let rx = stream_directory_to_memory(src_dir, 1024 * 1024);
+
+    // 5. Stream the chunks through the AEAD cipher and broadcast to all files
+    encrypt_pipeline(rx, output_files, &master_key, bundle_id, base_nonce_prefix)
+        .map_err(|e| anyhow!("Encryption pipeline failed: {}", e))?;
 
     Ok(())
 }

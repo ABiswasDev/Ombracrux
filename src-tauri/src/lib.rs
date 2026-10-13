@@ -1,10 +1,13 @@
 use std::fs::File;
-use std::io::{Read, Result as IoResult};
+use std::io::{Read, Write, Result as IoResult};
 use std::path::Path;
 use std::time::Instant;
 use tauri::{AppHandle, Emitter};
-use ombracrux_core::split::split_file;
-use ombracrux_core::restore::restore_file;
+
+use ombracrux_core::split::split_directory;
+use ombracrux_core::restore::restore_pipeline;
+use ombracrux_core::format::ShareHeader;
+use ombracrux_core::shares::reconstruct_key;
 
 #[derive(Clone, serde::Serialize)]
 struct ProgressPayload {
@@ -12,7 +15,62 @@ struct ProgressPayload {
     eta_seconds: f64,
 }
 
-/// Wraps a standard file reader to calculate speed, ETA, and emit progress to the UI
+// Recursively calculates total uncompressed directory size
+fn calculate_dir_size(path: &Path) -> u64 {
+    let mut size = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                size += std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+            } else if p.is_dir() {
+                size += calculate_dir_size(&p);
+            }
+        }
+    }
+    size
+}
+
+// Centralized math for Progress Bars and ETA
+fn emit_progress(app: &AppHandle, event: &str, current: u64, total: u64, last_emit: &mut Instant, start_time: &Instant) {
+    if last_emit.elapsed().as_millis() > 50 || current >= total {
+        let elapsed = start_time.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 { current as f64 / elapsed } else { 0.0 };
+        
+        let eta = if speed > 0.0 && total > current { (total - current) as f64 / speed } else { 0.0 };
+        
+        let mut percent = if total > 0 { (current as f64 / total as f64) * 100.0 } else { 0.0 };
+        if percent > 100.0 { percent = 100.0; } // Clamp at 100% to account for TAR headers
+
+        let _ = app.emit(event, ProgressPayload { percent, eta_seconds: eta });
+        *last_emit = Instant::now();
+    }
+}
+
+// Tracks bytes being WRITTEN out to .ombracrx files during splitting
+struct ProgressWriter<'a, W: Write> {
+    inner: W,
+    app: &'a AppHandle,
+    total_bytes: u64,
+    bytes_written: u64,
+    start_time: Instant,
+    last_emit: Instant,
+    event_name: &'static str,
+}
+
+impl<'a, W: Write> Write for ProgressWriter<'a, W> {
+    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
+        let n = self.inner.write(buf)?;
+        self.bytes_written += n as u64;
+        emit_progress(self.app, self.event_name, self.bytes_written, self.total_bytes, &mut self.last_emit, &self.start_time);
+        Ok(n)
+    }
+    fn flush(&mut self) -> IoResult<()> {
+        self.inner.flush()
+    }
+}
+
+// Tracks bytes being READ in from .ombracrx files during restoration
 struct ProgressReader<'a, R: Read> {
     inner: R,
     app: &'a AppHandle,
@@ -26,110 +84,92 @@ struct ProgressReader<'a, R: Read> {
 impl<'a, R: Read> Read for ProgressReader<'a, R> {
     fn read(&mut self, buf: &mut [u8]) -> IoResult<usize> {
         let n = self.inner.read(buf)?;
-        if n == 0 { return Ok(0); } // EOF reached
-
-        self.bytes_read += n as u64;
-
-        // Throttle UI updates to every 50ms to prevent frontend lag
-        if self.last_emit.elapsed().as_millis() > 50 || self.bytes_read >= self.total_bytes {
-            let elapsed = self.start_time.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.0 { self.bytes_read as f64 / elapsed } else { 0.0 };
-            let eta = if speed > 0.0 && self.total_bytes > self.bytes_read { 
-                (self.total_bytes - self.bytes_read) as f64 / speed 
-            } else { 
-                0.0 
-            };
-            
-            let mut percent = if self.total_bytes > 0 { (self.bytes_read as f64 / self.total_bytes as f64) * 100.0 } else { 0.0 };
-            if percent > 100.0 { percent = 100.0; } // Cap at 100% (MAC tags add slight overhead)
-
-            let _ = self.app.emit(self.event_name, ProgressPayload { percent, eta_seconds: eta });
-            self.last_emit = Instant::now();
+        if n > 0 {
+            self.bytes_read += n as u64;
+            emit_progress(self.app, self.event_name, self.bytes_read, self.total_bytes, &mut self.last_emit, &self.start_time);
         }
         Ok(n)
     }
 }
 
 #[tauri::command]
-async fn split_action(app: AppHandle, input_dir: String, vault_name: String, output_dir: String, threshold: u8, total_shares: u8) -> Result<String, String> {
+async fn split_action(
+    app: AppHandle, input_dir: String, vault_name: String, output_dir: String, threshold: u8, total_shares: u8
+) -> Result<String, String> {
     let input_path = Path::new(&input_dir);
-    
-    // Safety check: Ensure directory is not empty
-    let is_empty = std::fs::read_dir(input_path).map_err(|e| format!("Failed to read directory: {}", e))?.next().is_none();
-    if is_empty { return Err("The selected directory is empty. Nothing to protect.".to_string()); }
 
-    let _ = app.emit("status-msg", "Bundling directory into secure archive...");
+    let total_bytes = calculate_dir_size(input_path);
+    if total_bytes == 0 {
+        return Err("The selected directory is empty. Nothing to protect.".to_string());
+    }
 
-    let tmp_tar_path = Path::new(&output_dir).join(format!("{}.tmp.tar", vault_name));
-    let tar_file = File::create(&tmp_tar_path).map_err(|e| format!("Failed to create temp archive: {}", e))?;
-    let mut builder = tar::Builder::new(tar_file);
-    
-    // Pack the entire folder cleanly
-    let dir_name = input_path.file_name().unwrap_or_default();
-    builder.append_dir_all(dir_name, input_path).map_err(|e| format!("Failed to archive directory: {}", e))?;
-    builder.into_inner().map_err(|e| format!("Failed to finalize archive: {}", e))?;
-
-    let _ = app.emit("status-msg", "Encryption is in progress...");
+    let _ = app.emit("status-msg", "Streaming directory into secure threshold shares...");
 
     let mut output_files = Vec::new();
+    let start_time = Instant::now();
+    
     for i in 1..=total_shares {
         let out_path = Path::new(&output_dir).join(format!("{}.part{}.ombracrx", vault_name, i));
         let f = File::create(out_path).map_err(|e| format!("Failed to create share {}: {}", i, e))?;
-        output_files.push(f);
+        
+        // Wrap the raw files in our UI tracker
+        output_files.push(ProgressWriter {
+            inner: f, app: &app, total_bytes, bytes_written: 0,
+            start_time, last_emit: Instant::now(), event_name: "split-progress",
+        });
     }
 
-    let input_tar = File::open(&tmp_tar_path).map_err(|e| format!("Failed to read temp archive: {}", e))?;
-    let total_bytes = input_tar.metadata().map(|m| m.len()).unwrap_or(0);
-    
-    // Attach the progress monitor to the input stream
-    let progress_reader = ProgressReader {
-        inner: input_tar, app: &app, total_bytes, bytes_read: 0,
-        start_time: Instant::now(), last_emit: Instant::now(), event_name: "split-progress",
-    };
-
-    let crypto_result = split_file(progress_reader, output_files, threshold, total_shares);
-    
-    let _ = std::fs::remove_file(&tmp_tar_path); // Wipe temporary archive
-    crypto_result.map_err(|e| e.to_string())?;
+    split_directory(input_path, output_files, threshold, total_shares).map_err(|e| e.to_string())?;
 
     let _ = app.emit("status-msg", "Encryption has been finished.");
     Ok("Split successful".to_string())
 }
 
 #[tauri::command]
-async fn restore_action(app: AppHandle, share_paths: Vec<String>, output_dir: String) -> Result<String, String> {
-    let _ = app.emit("status-msg", "Decryption is in progress...");
+async fn restore_action(
+    app: AppHandle, share_paths: Vec<String>, output_dir: String
+) -> Result<String, String> {
+    let _ = app.emit("status-msg", "Authenticating headers and reconstructing key...");
 
-    let mut input_files = Vec::new();
-    let total_bytes = if !share_paths.is_empty() {
-        std::fs::metadata(&share_paths[0]).map(|m| m.len()).unwrap_or(0)
-    } else { 0 };
+    if share_paths.is_empty() { return Err("No shares provided for restoration.".to_string()); }
 
-    for path in share_paths {
-        let f = File::open(&path).map_err(|e| format!("Failed to open share {}: {}", path, e))?;
-        // Wrap every share in a progress monitor
-        input_files.push(ProgressReader {
-            inner: f, app: &app, total_bytes, bytes_read: 0,
-            start_time: Instant::now(), last_emit: Instant::now(), event_name: "restore-progress",
-        });
-    }
-
-    let tmp_tar_path = Path::new(&output_dir).join("ombracrux_restore.tmp.tar");
-    let mut out_file = File::create(&tmp_tar_path).map_err(|e| format!("Failed to create temp output: {}", e))?;
-
-    if let Err(e) = restore_file(input_files, &mut out_file) {
-        let _ = std::fs::remove_file(&tmp_tar_path);
-        return Err(e.to_string());
-    }
-
-    let _ = app.emit("status-msg", "Unpacking files to destination...");
-
-    let tar_file = File::open(&tmp_tar_path).map_err(|e| format!("Failed to read decrypted archive: {}", e))?;
-    let mut archive = tar::Archive::new(tar_file);
-    let unpack_result = archive.unpack(&output_dir);
+    let mut ssss_shares = Vec::new();
+    let mut bundle_id = [0u8; 16];
+    let mut base_nonce_prefix = [0u8; 16];
+    let mut threshold = 0;
     
-    let _ = std::fs::remove_file(&tmp_tar_path);
-    unpack_result.map_err(|e| format!("Failed to unpack files: {}", e))?;
+    let mut active_share_file: Option<File> = None;
+    let total_bytes = std::fs::metadata(&share_paths[0]).map(|m| m.len()).unwrap_or(0);
+
+    for (i, path) in share_paths.iter().enumerate() {
+        let mut f = File::open(path).map_err(|e| format!("Failed to open share {}: {}", path, e))?;
+        let header = ShareHeader::read_from(&mut f).map_err(|e| format!("Invalid or corrupted header in {}: {}", path, e))?;
+        
+        ssss_shares.push(header.ssss_share_data);
+
+        if i == 0 {
+            bundle_id = header.bundle_id;
+            base_nonce_prefix = header.base_nonce_prefix;
+            threshold = header.threshold;
+            active_share_file = Some(f); 
+        }
+    }
+
+    let master_key = reconstruct_key(&ssss_shares, threshold).map_err(|e| format!("Failed to reconstruct master key: {}", e))?;
+
+    let _ = app.emit("status-msg", "Decrypting and unpacking files securely...");
+
+    let target_dest = Path::new(&output_dir);
+    let share_file = active_share_file.unwrap();
+
+    // Wrap the raw file in our UI tracker before passing it to the core
+    let progress_reader = ProgressReader {
+        inner: share_file, app: &app, total_bytes, bytes_read: 0,
+        start_time: Instant::now(), last_emit: Instant::now(), event_name: "restore-progress",
+    };
+
+    restore_pipeline(progress_reader, &master_key, bundle_id, base_nonce_prefix, target_dest)
+        .map_err(|e| format!("Restoration failed: {}", e))?;
 
     let _ = app.emit("status-msg", "Decryption has been finished.");
     Ok("Restore successful".to_string())

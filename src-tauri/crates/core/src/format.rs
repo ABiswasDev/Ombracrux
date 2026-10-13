@@ -1,91 +1,79 @@
-use anyhow::{anyhow, Result};
-use std::convert::TryInto;
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
+use std::io::{self, Read, Write};
 
-/// Magic bytes to identify an Ombracrux V2 share file ("OMBRACRX")
-pub const MAGIC_BYTES: [u8; 8] = *b"OMBRACRX";
-pub const FORMAT_VERSION: u8 = 1;
-pub const HEADER_SIZE: usize = 27; // 8 (magic) + 1 (version) + 16 (bundle) + 1 (threshold) + 1 (total)
+pub const MAGIC_BYTES: &[u8; 8] = b"OMBRACRX";
+pub const FORMAT_VERSION: u16 = 2;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ShareHeader {
+    pub magic: [u8; 8],
+    pub version: u16,
     pub bundle_id: [u8; 16],
-    pub threshold: u8,
     pub total_shares: u8,
+    pub threshold: u8,
+    pub share_index: u8,
+    pub base_nonce_prefix: [u8; 16],
+    pub ssss_share_data: Vec<u8>,
 }
 
 impl ShareHeader {
-    /// Creates a new header with a random bundle ID
-    pub fn new(threshold: u8, total_shares: u8) -> Self {
-        Self {
-            bundle_id: [0; 16], // We populate this with random bytes during the split process
-            threshold,
-            total_shares,
-        }
+    pub fn write_to<W: Write>(&self, mut writer: W) -> io::Result<()> {
+        writer.write_all(&self.magic)?;
+        writer.write_u16::<BigEndian>(self.version)?;
+        writer.write_all(&self.bundle_id)?;
+        writer.write_u8(self.total_shares)?;
+        writer.write_u8(self.threshold)?;
+        writer.write_u8(self.share_index)?;
+        writer.write_all(&self.base_nonce_prefix)?;
+        
+        writer.write_u16::<BigEndian>(self.ssss_share_data.len() as u16)?;
+        writer.write_all(&self.ssss_share_data)?;
+        Ok(())
     }
 
-    /// Serializes the header into a fixed-size byte array for writing to disk
-    pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
-        let mut buffer = [0u8; HEADER_SIZE];
-        buffer[0..8].copy_from_slice(&MAGIC_BYTES);
-        buffer[8] = FORMAT_VERSION;
-        buffer[9..25].copy_from_slice(&self.bundle_id);
-        buffer[25] = self.threshold;
-        buffer[26] = self.total_shares;
-        buffer
-    }
-
-    /// Parses and validates a header from raw bytes read from a file
-    pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
-        if buffer.len() < HEADER_SIZE {
-            return Err(anyhow!("File is too small to contain a valid Ombracrux header"));
+    pub fn read_from<R: Read>(mut reader: R) -> io::Result<Self> {
+        let mut magic = [0u8; 8];
+        reader.read_exact(&mut magic)?;
+        if magic != *MAGIC_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid magic bytes"));
         }
 
-        let magic: [u8; 8] = buffer[0..8].try_into()?;
-        if magic != MAGIC_BYTES {
-            return Err(anyhow!("Invalid magic bytes: not an Ombracrux share"));
-        }
-
-        let version = buffer[8];
+        let version = reader.read_u16::<BigEndian>()?;
         if version != FORMAT_VERSION {
-            return Err(anyhow!("Unsupported format version: {}", version));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported version"));
         }
 
-        let bundle_id: [u8; 16] = buffer[9..25].try_into()?;
-        let threshold = buffer[25];
-        let total_shares = buffer[26];
+        let mut bundle_id = [0u8; 16];
+        reader.read_exact(&mut bundle_id)?;
 
-        if threshold == 0 || threshold > total_shares {
-            return Err(anyhow!("Invalid threshold or total shares configuration in header"));
+        let total_shares = reader.read_u8()?;
+        let threshold = reader.read_u8()?;
+        if threshold > total_shares || threshold == 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid threshold constraints"));
         }
+
+        let share_index = reader.read_u8()?;
+        let mut base_nonce_prefix = [0u8; 16];
+        reader.read_exact(&mut base_nonce_prefix)?;
+
+        let ssss_len = reader.read_u16::<BigEndian>()?;
+        // Defense in depth: prevent malicious headers from allocating massive RAM
+        if ssss_len > 4096 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "SSSS payload exceeds max size"));
+        }
+        
+        let mut ssss_share_data = vec![0u8; ssss_len as usize];
+        reader.read_exact(&mut ssss_share_data)?;
 
         Ok(Self {
+            magic,
+            version,
             bundle_id,
-            threshold,
             total_shares,
+            threshold,
+            share_index,
+            base_nonce_prefix,
+            ssss_share_data,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_header_serialization() {
-        let mut header = ShareHeader::new(3, 5);
-        header.bundle_id = [7; 16]; // Mock bundle ID for testing
-
-        let bytes = header.to_bytes();
-        let parsed = ShareHeader::from_bytes(&bytes).unwrap();
-
-        assert_eq!(header, parsed);
-    }
-
-    #[test]
-    fn test_invalid_magic_bytes() {
-        let mut bytes = ShareHeader::new(3, 5).to_bytes();
-        bytes[0] = b'X'; // Corrupt the magic bytes
-        
-        assert!(ShareHeader::from_bytes(&bytes).is_err());
     }
 }

@@ -2443,9 +2443,11 @@ name = "ombracrux-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "byteorder",
  "chacha20poly1305",
  "rand",
  "sharks",
+ "tar",
  "thiserror 1.0.69",
  "zeroize",
 ]

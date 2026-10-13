@@ -1,184 +1,70 @@
-use anyhow::{anyhow, Result};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    Key, XChaCha20Poly1305, XNonce,
-};
-use rand::RngCore;
-use std::io::{Read, Write};
-use zeroize::Zeroize;
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use std::io;
+use std::sync::mpsc::Receiver;
+use byteorder::{BigEndian, WriteBytesExt};
 
-// Process files in 1MB chunks to keep memory usage low and stable
-const CHUNK_SIZE: usize = 1024 * 1024;
-
-/// Generates a cryptographically secure random 256-bit (32-byte) key
-pub fn generate_key() -> [u8; 32] {
-    let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
-    key
+/// Constructs the 24-byte XChaCha20 Nonce: [16-byte Prefix] + [8-byte u64 Chunk Index]
+fn derive_nonce(prefix: &[u8; 16], chunk_idx: u64) -> XNonce {
+    let mut nonce_bytes = [0u8; 24];
+    nonce_bytes[..16].copy_from_slice(prefix);
+    nonce_bytes[16..].copy_from_slice(&chunk_idx.to_be_bytes());
+    XNonce::from(nonce_bytes)
 }
 
-/// Generates a cryptographically secure random 192-bit (24-byte) extended nonce
-pub fn generate_nonce() -> [u8; 24] {
-    let mut nonce = [0u8; 24];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
-    nonce
+/// Constructs the Associated Data to bind the chunk to its exact position and file.
+fn construct_aad(bundle_id: &[u8; 16], chunk_idx: u64, is_final: bool) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(25);
+    aad.extend_from_slice(bundle_id);
+    aad.extend_from_slice(&chunk_idx.to_be_bytes());
+    aad.push(if is_final { 1 } else { 0 });
+    aad
 }
 
-/// Safely increments the nonce for each chunk to prevent key-stream reuse
-fn increment_nonce(nonce: &mut [u8; 24]) {
-    for byte in nonce.iter_mut().rev() {
-        let (new_byte, overflow) = byte.overflowing_add(1);
-        *byte = new_byte;
-        if !overflow {
-            break;
-        }
-    }
-}
-
-/// Encrypts a data stream in chunks, authenticating each chunk to prevent tampering.
-pub fn encrypt_stream<R: Read, W: Write>(
-    mut reader: R,
-    mut writer: W,
-    key_bytes: &[u8; 32],
-    base_nonce_bytes: &[u8; 24],
-) -> Result<()> {
-    let key = Key::from_slice(key_bytes);
-    let cipher = XChaCha20Poly1305::new(key);
-
-    let mut nonce_bytes = *base_nonce_bytes;
-    let mut buffer = vec![0u8; CHUNK_SIZE];
+/// Consumes the plaintext Tarball stream and broadcasts it to N authenticated shares.
+pub fn encrypt_pipeline<W: std::io::Write>(
+    rx: Receiver<Vec<u8>>,
+    mut output_shares: Vec<W>,
+    master_key: &[u8; 32],
+    bundle_id: [u8; 16],
+    base_nonce_prefix: [u8; 16],
+) -> Result<(), Box<dyn std::error::Error>> {
+    
+    let cipher = XChaCha20Poly1305::new(master_key.into());
     let mut chunk_index: u64 = 0;
 
-    loop {
-        let bytes_read = reader.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break; // End of file reached
-        }
+    // We buffer exactly one chunk ahead so we can accurately detect the `is_final` state.
+    let mut current_chunk = rx.recv().ok();
 
-        let nonce = XNonce::from_slice(&nonce_bytes);
+    while let Some(plaintext) = current_chunk {
+        let next_chunk = rx.recv().ok();
+        let is_final = next_chunk.is_none();
 
-        // Bind the chunk index to the encryption as Associated Data (AAD).
-        // This makes it cryptographically impossible for an attacker to reorder chunks.
-        let aad = chunk_index.to_le_bytes();
+        let nonce = derive_nonce(&base_nonce_prefix, chunk_index);
+        let aad = construct_aad(&bundle_id, chunk_index, is_final);
+
         let payload = Payload {
-            msg: &buffer[..bytes_read],
+            msg: &plaintext,
             aad: &aad,
         };
 
-        let ciphertext = cipher
-            .encrypt(nonce, payload)
-            .map_err(|e| anyhow!("Encryption failed at chunk {}: {:?}", chunk_index, e))?;
+        // Encrypts the chunk and appends the 16-byte Poly1305 tag automatically.
+        let ciphertext = cipher.encrypt(&nonce, payload)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Encryption failed"))?;
 
-        // Write the chunk length (4 bytes, little-endian) so the decryptor knows how much to read
-        let len = ciphertext.len() as u32;
-        writer.write_all(&len.to_le_bytes())?;
+        // Broadcast to all N files simultaneously
+        for file in output_shares.iter_mut() {
+            file.write_u32::<BigEndian>(ciphertext.len() as u32)?;
+            file.write_all(&ciphertext)?;
+        }
 
-        // Write the actual ciphertext and its appended 16-byte MAC tag
-        writer.write_all(&ciphertext)?;
-
-        increment_nonce(&mut nonce_bytes);
+        current_chunk = next_chunk;
         chunk_index += 1;
     }
 
-    // Securely wipe the nonce from RAM when finished
-    nonce_bytes.zeroize();
+    for file in output_shares.iter_mut() {
+        file.flush()?;
+    }
+
     Ok(())
-}
-
-/// Decrypts an authenticated data stream. Fails immediately if any chunk is altered.
-pub fn decrypt_stream<R: Read, W: Write>(
-    mut reader: R,
-    mut writer: W,
-    key_bytes: &[u8; 32],
-    base_nonce_bytes: &[u8; 24],
-) -> Result<()> {
-    let key = Key::from_slice(key_bytes);
-    let cipher = XChaCha20Poly1305::new(key);
-
-    let mut nonce_bytes = *base_nonce_bytes;
-    let mut chunk_index: u64 = 0;
-
-    loop {
-        let mut len_buf = [0u8; 4];
-        let bytes_read = reader.read(&mut len_buf)?;
-        if bytes_read == 0 {
-            break; // End of file reached
-        }
-        if bytes_read < 4 {
-            return Err(anyhow!("Unexpected EOF while reading chunk length. File may be truncated."));
-        }
-
-        let chunk_len = u32::from_le_bytes(len_buf) as usize;
-        
-        // Sanity check: prevent memory exhaustion attacks from maliciously altered length headers
-        if chunk_len > CHUNK_SIZE + 16 {
-            return Err(anyhow!("Chunk size {} exceeds maximum allowed bounds.", chunk_len));
-        }
-
-        let mut ciphertext = vec![0u8; chunk_len];
-        reader.read_exact(&mut ciphertext)?;
-
-        let nonce = XNonce::from_slice(&nonce_bytes);
-        let aad = chunk_index.to_le_bytes();
-        let payload = Payload {
-            msg: &ciphertext,
-            aad: &aad,
-        };
-
-        // Decryption automatically verifies the Poly1305 MAC tag
-        let plaintext = cipher.decrypt(nonce, payload).map_err(|_| {
-            anyhow!("Decryption failed at chunk {}! The data is corrupted or has been tampered with.", chunk_index)
-        })?;
-
-        writer.write_all(&plaintext)?;
-
-        increment_nonce(&mut nonce_bytes);
-        chunk_index += 1;
-    }
-
-    nonce_bytes.zeroize();
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Cursor;
-
-    #[test]
-    fn test_encrypt_decrypt_stream_success() {
-        let data = b"Hello Ombracrux! This is a test of the AEAD streaming architecture.";
-        let key = generate_key();
-        let nonce = generate_nonce();
-
-        // Encrypt
-        let mut encrypted_buffer = Vec::new();
-        encrypt_stream(Cursor::new(data), &mut encrypted_buffer, &key, &nonce).unwrap();
-
-        // Decrypt
-        let mut decrypted_buffer = Vec::new();
-        decrypt_stream(Cursor::new(encrypted_buffer), &mut decrypted_buffer, &key, &nonce).unwrap();
-
-        assert_eq!(data.as_slice(), decrypted_buffer.as_slice());
-    }
-
-    #[test]
-    fn test_tamper_detection_fails_safely() {
-        let data = b"Highly sensitive vault data.";
-        let key = generate_key();
-        let nonce = generate_nonce();
-
-        let mut encrypted_buffer = Vec::new();
-        encrypt_stream(Cursor::new(data), &mut encrypted_buffer, &key, &nonce).unwrap();
-
-        // Simulate tampering by flipping a single bit in the ciphertext
-        let last_idx = encrypted_buffer.len() - 1;
-        encrypted_buffer[last_idx] ^= 1;
-
-        let mut decrypted_buffer = Vec::new();
-        let result = decrypt_stream(Cursor::new(encrypted_buffer), &mut decrypted_buffer, &key, &nonce);
-
-        // The test explicitly expects an error here. If it succeeds, the cryptography is broken.
-        assert!(result.is_err(), "Decryption should have failed due to tampered ciphertext!");
-    }
 }

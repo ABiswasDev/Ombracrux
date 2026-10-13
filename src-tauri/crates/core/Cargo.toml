@@ -10,3 +10,5 @@ zeroize = { version = "1.7", features = ["zeroize_derive"] }
 thiserror = "1.0"
 anyhow = "1.0"
 rand = "0.8"
+byteorder = "1.5.0"
+tar = "0.4.46"

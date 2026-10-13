@@ -1,120 +1,159 @@
-use anyhow::{anyhow, Result};
-use std::io::{Read, Write};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use byteorder::{BigEndian, ReadBytesExt};
+use rand::RngCore;
+use std::fs::{self};
+use std::io::{self, Read};
+use std::path::Path;
 
-use crate::crypto::decrypt_stream;
-use crate::format::{ShareHeader, HEADER_SIZE};
-use crate::shares::reconstruct_key;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
-/// Restores an original file from a collection of share streams.
-pub fn restore_file<R: Read, W: Write>(
-    mut inputs: Vec<R>,
-    mut output: W,
-) -> Result<()> {
-    if inputs.is_empty() {
-        return Err(anyhow!("No input shares provided for restoration."));
-    }
-
-    let mut key_shares = Vec::new();
-    let mut expected_bundle_id = None;
-    let mut expected_threshold = 0;
-    let mut expected_nonce = None;
-
-    // 1. Read and validate all headers and extract the key shares
-    for (index, reader) in inputs.iter_mut().enumerate() {
-        // Read header
-        let mut header_buf = [0u8; HEADER_SIZE];
-        reader.read_exact(&mut header_buf)
-            .map_err(|_| anyhow!("Failed to read header from share index {}. File may be too small.", index))?;
-        
-        let header = ShareHeader::from_bytes(&header_buf)?;
-
-        // Verify bundle matching (prevents mixing shares from different backups)
-        if let Some(expected_id) = expected_bundle_id {
-            if header.bundle_id != expected_id {
-                return Err(anyhow!("Bundle ID mismatch! You are mixing shares from different backups."));
-            }
-        } else {
-            expected_bundle_id = Some(header.bundle_id);
-            expected_threshold = header.threshold;
-        }
-
-        // Read share length
-        let mut len_buf = [0u8; 2];
-        reader.read_exact(&mut len_buf)?;
-        let share_len = u16::from_le_bytes(len_buf) as usize;
-
-        // Read share bytes
-        let mut share_bytes = vec![0u8; share_len];
-        reader.read_exact(&mut share_bytes)?;
-        key_shares.push(share_bytes);
-
-        // Read nonce
-        let mut nonce = [0u8; 24];
-        reader.read_exact(&mut nonce)?;
-
-        if let Some(expected_n) = expected_nonce {
-            if nonce != expected_n {
-                return Err(anyhow!("Nonce mismatch across shares. Shares may be corrupted."));
-            }
-        } else {
-            expected_nonce = Some(nonce);
-        }
-    }
-
-    // 2. Enforce the threshold barrier
-    if key_shares.len() < expected_threshold as usize {
-        return Err(anyhow!(
-            "Insufficient shares. Provided {}, required {}.",
-            key_shares.len(),
-            expected_threshold
-        ));
-    }
-
-    // 3. Reconstruct the XChaCha20 encryption key
-    let encryption_key = reconstruct_key(&key_shares, expected_threshold)?;
-    let nonce = expected_nonce.unwrap(); // Guaranteed to be set if we reached here
-
-    // 4. Decrypt the payload using the FIRST provided stream.
-    // (All valid shares contain the identical encrypted payload, so we only need to stream from one).
-    let primary_reader = &mut inputs[0];
-    decrypt_stream(primary_reader, &mut output, &encryption_key, &nonce)?;
-
-    Ok(())
+/// Derives the identical Nonce used during encryption.
+fn derive_nonce(prefix: &[u8; 16], chunk_idx: u64) -> XNonce {
+    let mut nonce_bytes = [0u8; 24];
+    nonce_bytes[..16].copy_from_slice(prefix);
+    nonce_bytes[16..].copy_from_slice(&chunk_idx.to_be_bytes());
+    *XNonce::from_slice(&nonce_bytes)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::split::split_file;
-    use std::io::Cursor;
+/// Constructs the exact Associated Data to validate sequence and integrity.
+fn construct_aad(bundle_id: &[u8; 16], chunk_idx: u64, is_final: bool) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(25);
+    aad.extend_from_slice(bundle_id);
+    aad.extend_from_slice(&chunk_idx.to_be_bytes());
+    aad.push(if is_final { 1 } else { 0 });
+    aad
+}
 
-    #[test]
-    fn test_end_to_end_split_and_restore() {
-        let original_data = b"This is the highly confidential payload that needs threshold recovery. It represents a large file.";
-        let threshold = 3;
-        let total_shares = 5;
+/// A custom streaming reader that decrypts XChaCha20 chunks on the fly.
+/// This prevents loading massive files into RAM during restoration.
+struct DecryptReader<R: Read> {
+    reader: R,
+    cipher: XChaCha20Poly1305,
+    bundle_id: [u8; 16],
+    base_nonce_prefix: [u8; 16],
+    chunk_index: u64,
+    buffer: Vec<u8>,
+    buffer_pos: usize,
+    is_eof: bool,
+}
 
-        // Mock 5 output files in memory
-        let mut out1 = Vec::new();
-        let mut out2 = Vec::new();
-        let mut out3 = Vec::new();
-        let mut out4 = Vec::new();
-        let mut out5 = Vec::new();
+impl<R: Read> Read for DecryptReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Yield remaining bytes from the currently decrypted chunk
+        if self.buffer_pos < self.buffer.len() {
+            let len = std::cmp::min(buf.len(), self.buffer.len() - self.buffer_pos);
+            buf[..len].copy_from_slice(&self.buffer[self.buffer_pos..self.buffer_pos + len]);
+            self.buffer_pos += len;
+            return Ok(len);
+        }
 
-        // 1. SPLIT: Write to all 5 "files" simultaneously
-        let writers: Vec<&mut Vec<u8>> = vec![&mut out1, &mut out2, &mut out3, &mut out4, &mut out5];
-        split_file(Cursor::new(original_data), writers, threshold, total_shares).unwrap();
+        if self.is_eof {
+            return Ok(0);
+        }
 
-        // Ensure data was actually written
-        assert!(!out1.is_empty());
+        // Read the exact size of the next incoming chunk
+        let chunk_len = match self.reader.read_u32::<BigEndian>() {
+            Ok(len) => len,
+            Err(ref e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                self.is_eof = true;
+                return Ok(0);
+            }
+            Err(e) => return Err(e),
+        };
 
-        // 2. RESTORE: Intentionally drop 2 shares and attempt to restore using only shares 2, 4, and 5
-        let readers: Vec<&[u8]> = vec![out2.as_slice(), out4.as_slice(), out5.as_slice()];
-        let mut restored_data = Vec::new();
+        // Hard cap at 1MB + 16 bytes MAC to prevent RAM exhaustion attacks
+        if chunk_len > 1024 * 1024 + 16 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Chunk exceeds maximum allowed size"));
+        }
+
+        let mut ciphertext = vec![0u8; chunk_len as usize];
+        self.reader.read_exact(&mut ciphertext)?;
+
+        let nonce = derive_nonce(&self.base_nonce_prefix, self.chunk_index);
         
-        restore_file(readers, &mut restored_data).unwrap();
+        let aad_standard = construct_aad(&self.bundle_id, self.chunk_index, false);
+        let aad_final = construct_aad(&self.bundle_id, self.chunk_index, true);
 
-        // 3. VERIFY: The recovered file must perfectly match the input
-        assert_eq!(original_data.as_slice(), restored_data.as_slice());
+        // Try decrypting as a standard chunk first. If Poly1305 authentication fails, 
+        // try decrypting it as the final chunk. If both fail, the file is corrupted/tampered.
+        let payload_standard = Payload { msg: &ciphertext, aad: &aad_standard };
+        let decrypted = match self.cipher.decrypt(&nonce, payload_standard) {
+            Ok(pt) => pt,
+            Err(_) => {
+                let payload_final = Payload { msg: &ciphertext, aad: &aad_final };
+                match self.cipher.decrypt(&nonce, payload_final) {
+                    Ok(pt) => {
+                        self.is_eof = true; 
+                        pt
+                    },
+                    Err(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "Poly1305 Authentication Failed: Corrupted or tampered share")),
+                }
+            }
+        };
+
+        self.buffer = decrypted;
+        self.buffer_pos = 0;
+        self.chunk_index += 1;
+
+        // Recursively return the newly decrypted bytes
+        self.read(buf)
+    }
+}
+
+/// Executes the full, safe restoration pipeline.
+pub fn restore_pipeline<R: Read>(
+    share_file: R,
+    master_key: &[u8; 32],
+    bundle_id: [u8; 16],
+    base_nonce_prefix: [u8; 16],
+    target_dest: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    
+    // 1. Generate a unique, isolated staging directory
+    let mut rng = rand::thread_rng();
+    let staging_dir_name = format!(".ombracrx-restore-{:016x}", rng.next_u64());
+    let staging_path = target_dest.parent().unwrap_or(Path::new(".")).join(staging_dir_name);
+
+    fs::create_dir_all(&staging_path)?;
+
+    // 2. Lock down permissions strictly to the current user
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&staging_path)?.permissions();
+        perms.set_mode(0o700); // rwx------
+        fs::set_permissions(&staging_path, perms)?;
+    }
+
+    // 3. Initialize the DecryptReader
+    let cipher = XChaCha20Poly1305::new(master_key.into());
+    let decrypt_stream = DecryptReader {
+        reader: share_file,
+        cipher,
+        bundle_id,
+        base_nonce_prefix,
+        chunk_index: 0,
+        buffer: Vec::new(),
+        buffer_pos: 0,
+        is_eof: false,
+    };
+
+    // 4. Pipe the decrypted stream directly into the tar unpacker
+    let mut archive = tar::Archive::new(decrypt_stream);
+    
+    // 5. Execute extraction. If ANY cryptographic check fails mid-stream, 
+    // it triggers an error and we instantly jump to the cleanup block.
+    match archive.unpack(&staging_path) {
+        Ok(_) => {
+            // Success: Atomically commit the staging folder to the final destination
+            fs::rename(&staging_path, target_dest)?;
+            Ok(())
+        }
+        Err(e) => {
+            // Failure: Shred the partially extracted, unverified files
+            let _ = fs::remove_dir_all(&staging_path);
+            Err(Box::new(e))
+        }
     }
 }

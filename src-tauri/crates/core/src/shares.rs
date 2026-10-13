@@ -10,7 +10,6 @@ pub fn split_key(key: &[u8; 32], threshold: u8, total_shares: u8) -> Result<Vec<
     let sharks = Sharks(threshold);
     let dealer = sharks.dealer(key.as_slice());
     
-    // Extract the requested number of shares and serialize them to bytes
     let shares: Vec<Vec<u8>> = dealer
         .take(total_shares as usize)
         .map(|share| Vec::from(&share))
@@ -31,7 +30,6 @@ pub fn reconstruct_key(share_bytes: &[Vec<u8>], threshold: u8) -> Result<[u8; 32
 
     let sharks = Sharks(threshold);
     
-    // Deserialize raw bytes back into Shark Share objects
     let mut shares = Vec::new();
     for bytes in share_bytes {
         let share = Share::try_from(bytes.as_slice())
@@ -39,7 +37,6 @@ pub fn reconstruct_key(share_bytes: &[Vec<u8>], threshold: u8) -> Result<[u8; 32
         shares.push(share);
     }
 
-    // Recover the secret key mathematically
     let secret = sharks.recover(&shares)
         .map_err(|_| anyhow!("Failed to reconstruct the secret key from the provided shares."))?;
 
@@ -56,19 +53,23 @@ pub fn reconstruct_key(share_bytes: &[Vec<u8>], threshold: u8) -> Result<[u8; 32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::generate_key;
+    use rand::RngCore;
+
+    fn generate_test_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        key
+    }
 
     #[test]
     fn test_split_and_reconstruct_exact_threshold() {
-        let original_key = generate_key();
+        let original_key = generate_test_key();
         let threshold = 3;
         let total_shares = 5;
 
-        // Split the key into 5 shares
         let shares = split_key(&original_key, threshold, total_shares).unwrap();
         assert_eq!(shares.len(), 5);
 
-        // Take exactly 3 shares (the threshold) to reconstruct
         let selected_shares = vec![shares[0].clone(), shares[2].clone(), shares[4].clone()];
         
         let reconstructed_key = reconstruct_key(&selected_shares, threshold).unwrap();
@@ -77,13 +78,12 @@ mod tests {
 
     #[test]
     fn test_reconstruct_fails_with_insufficient_shares() {
-        let original_key = generate_key();
+        let original_key = generate_test_key();
         let threshold = 3;
         let total_shares = 5;
 
         let shares = split_key(&original_key, threshold, total_shares).unwrap();
 
-        // Try to reconstruct with only 2 shares (below threshold of 3)
         let selected_shares = vec![shares[0].clone(), shares[1].clone()];
         
         let result = reconstruct_key(&selected_shares, threshold);
@@ -92,8 +92,7 @@ mod tests {
 
     #[test]
     fn test_invalid_split_parameters() {
-        let key = generate_key();
-        // Trying to require 6 shares to unlock when only 5 exist
+        let key = generate_test_key();
         let result = split_key(&key, 6, 5);
         assert!(result.is_err());
     }
