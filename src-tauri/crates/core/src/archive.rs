@@ -3,75 +3,121 @@ use std::path::Path;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread;
 
-/// A custom writer that buffers data and sends it across a thread channel
-/// once it reaches the target chunk size.
+const CHANNEL_CAPACITY: usize = 2;
+
+#[derive(Debug)]
+pub enum ArchiveMessage {
+    Chunk(Vec<u8>),
+    End,
+    Error(String),
+}
+
+/// Streams TAR bytes through bounded memory buffers.
+///
+/// The channel holds at most two queued chunks. This is not the
+/// application's total memory usage: the writer and consumer also
+/// have their own buffers.
 pub struct ChannelWriter {
-    sender: SyncSender<Vec<u8>>,
+    sender: SyncSender<ArchiveMessage>,
     buffer: Vec<u8>,
     chunk_size: usize,
 }
 
 impl ChannelWriter {
-    pub fn new(sender: SyncSender<Vec<u8>>, chunk_size: usize) -> Self {
+    pub fn new(sender: SyncSender<ArchiveMessage>, chunk_size: usize) -> Self {
+        let chunk_size = chunk_size.max(1);
+
         Self {
             sender,
             buffer: Vec::with_capacity(chunk_size),
             chunk_size,
         }
     }
+
+    fn send_buffer(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(self.chunk_size));
+
+        self.sender.send(ArchiveMessage::Chunk(chunk)).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Encryption consumer stopped before archiving completed",
+            )
+        })
+    }
 }
 
 impl Write for ChannelWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut written = 0;
-        while written < buf.len() {
-            let space = self.chunk_size - self.buffer.len();
-            let to_copy = space.min(buf.len() - written);
-            self.buffer.extend_from_slice(&buf[written..written + to_copy]);
-            written += to_copy;
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let mut consumed = 0;
 
-            // When the buffer hits exactly 1MB, ship it to the encryptor thread.
-            // If the channel is full (2 chunks), this will safely block and pause the archiver.
+        while consumed < input.len() {
+            let available = self.chunk_size - self.buffer.len();
+            let count = available.min(input.len() - consumed);
+
+            self.buffer
+                .extend_from_slice(&input[consumed..consumed + count]);
+
+            consumed += count;
+
             if self.buffer.len() == self.chunk_size {
-                let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(self.chunk_size));
-                self.sender.send(chunk).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
+                self.send_buffer()?;
             }
         }
-        Ok(buf.len())
+
+        Ok(input.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        if !self.buffer.is_empty() {
-            let chunk = std::mem::replace(&mut self.buffer, Vec::new());
-            self.sender.send(chunk).map_err(|e| io::Error::new(io::ErrorKind::BrokenPipe, e))?;
-        }
-        Ok(())
+        self.send_buffer()
     }
 }
 
-/// Spawns a background thread to tar the directory and returns a receiver 
-/// yielding perfectly sized memory chunks.
-pub fn stream_directory_to_memory(src_dir: &Path, chunk_size: usize) -> Receiver<Vec<u8>> {
-    // Bounded capacity of 2 strictly enforces backpressure.
-    let (tx, rx) = sync_channel::<Vec<u8>>(2);
+/// Builds a TAR archive directly into a bounded in-memory channel.
+///
+/// No plaintext TAR file is created on disk. The receiver must
+/// require an explicit End message; channel disconnection alone
+/// is never considered successful completion.
+pub fn stream_directory_to_memory(src_dir: &Path, chunk_size: usize) -> Receiver<ArchiveMessage> {
+    let (tx, rx) = sync_channel::<ArchiveMessage>(CHANNEL_CAPACITY);
+    let status_tx = tx.clone();
     let src_dir = src_dir.to_path_buf();
+    let chunk_size = chunk_size.max(1);
 
     thread::spawn(move || {
-        let channel_writer = ChannelWriter::new(tx, chunk_size);
-        let mut tar = tar::Builder::new(channel_writer);
-        
-        // Appends files to the stream without loading them entirely into RAM
-        if let Err(e) = tar.append_dir_all(".", &src_dir) {
-            eprintln!("Archiving failed: {}", e);
+        let writer = ChannelWriter::new(tx, chunk_size);
+        let mut archive = tar::Builder::new(writer);
+
+        if let Err(error) = archive.append_dir_all(".", &src_dir) {
+            let _ = status_tx.send(ArchiveMessage::Error(format!(
+                "Failed to archive directory: {error}"
+            )));
             return;
         }
-        
-        let mut writer = match tar.into_inner() {
-            Ok(w) => w,
-            Err(_) => return,
+
+        let mut writer = match archive.into_inner() {
+            Ok(writer) => writer,
+            Err(error) => {
+                let _ = status_tx.send(ArchiveMessage::Error(format!(
+                    "Failed to finish TAR archive: {error}"
+                )));
+                return;
+            }
         };
-        let _ = writer.flush();
-        // Dropping `tx` automatically closes the channel, signaling EOF to the encryptor.
+
+        if let Err(error) = writer.flush() {
+            let _ = status_tx.send(ArchiveMessage::Error(format!(
+                "Failed to flush TAR stream: {error}"
+            )));
+            return;
+        }
+
+        // End is sent only after the TAR archive has finished
+        // and all buffered archive bytes have been delivered.
+        let _ = status_tx.send(ArchiveMessage::End);
     });
 
     rx
