@@ -32,20 +32,18 @@ fn path_entry_exists(path: &Path) -> IoResult<bool> {
 /// Symlinks and special filesystem objects are rejected for now.
 /// This also avoids recursive directory-symlink loops in progress scanning.
 fn calculate_dir_size(path: &Path) -> Result<u64, String> {
-    let entries = fs::read_dir(path).map_err(|error| {
-        format!("Cannot read source directory {}: {error}", path.display())
-    })?;
+    let entries = fs::read_dir(path)
+        .map_err(|error| format!("Cannot read source directory {}: {error}", path.display()))?;
 
     let mut total = 0u64;
 
     for entry_result in entries {
-        let entry = entry_result.map_err(|error| {
-            format!("Cannot inspect a source directory entry: {error}")
-        })?;
+        let entry = entry_result
+            .map_err(|error| format!("Cannot inspect a source directory entry: {error}"))?;
 
-        let file_type = entry.file_type().map_err(|error| {
-            format!("Cannot inspect {}: {error}", entry.path().display())
-        })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("Cannot inspect {}: {error}", entry.path().display()))?;
 
         if file_type.is_symlink() {
             return Err(format!(
@@ -56,17 +54,20 @@ fn calculate_dir_size(path: &Path) -> Result<u64, String> {
 
         if file_type.is_dir() {
             let child_size = calculate_dir_size(&entry.path())?;
-            total = total.checked_add(child_size).ok_or_else(|| {
-                "Source directory size overflow".to_string()
-            })?;
+            total = total
+                .checked_add(child_size)
+                .ok_or_else(|| "Source directory size overflow".to_string())?;
         } else if file_type.is_file() {
             let metadata = entry.metadata().map_err(|error| {
-                format!("Cannot read metadata for {}: {error}", entry.path().display())
+                format!(
+                    "Cannot read metadata for {}: {error}",
+                    entry.path().display()
+                )
             })?;
 
-            total = total.checked_add(metadata.len()).ok_or_else(|| {
-                "Source directory size overflow".to_string()
-            })?;
+            total = total
+                .checked_add(metadata.len())
+                .ok_or_else(|| "Source directory size overflow".to_string())?;
         } else {
             return Err(format!(
                 "Unsupported filesystem entry in source directory: {}",
@@ -112,11 +113,9 @@ fn validate_split_paths(
 
 fn valid_vault_name(name: &str) -> bool {
     !name.is_empty()
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric()
-                || character == '_'
-                || character == '-')
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
 }
 
 /// Holds hidden temporary files until all encrypted shares are complete.
@@ -142,11 +141,7 @@ impl ShareOutputTransaction {
         }
     }
 
-    fn create_partial(
-        &mut self,
-        output_dir: &Path,
-        final_path: PathBuf,
-    ) -> Result<File, String> {
+    fn create_partial(&mut self, output_dir: &Path, final_path: PathBuf) -> Result<File, String> {
         if path_entry_exists(&final_path)
             .map_err(|error| format!("Cannot inspect destination: {error}"))?
         {
@@ -157,10 +152,7 @@ impl ShareOutputTransaction {
         }
 
         if self.final_paths.iter().any(|path| path == &final_path) {
-            return Err(format!(
-                "Duplicate output path: {}",
-                final_path.display()
-            ));
+            return Err(format!("Duplicate output path: {}", final_path.display()));
         }
 
         // Create in the same directory/filesystem as the destination.
@@ -168,13 +160,11 @@ impl ShareOutputTransaction {
             .prefix(".ombracrux-")
             .suffix(".partial")
             .tempfile_in(output_dir)
-            .map_err(|error| {
-                format!("Cannot create temporary share file: {error}")
-            })?;
+            .map_err(|error| format!("Cannot create temporary share file: {error}"))?;
 
-        let writer = temporary.reopen().map_err(|error| {
-            format!("Cannot open temporary share for writing: {error}")
-        })?;
+        let writer = temporary
+            .reopen()
+            .map_err(|error| format!("Cannot open temporary share for writing: {error}"))?;
 
         self.partial_files.push(Some(temporary));
         self.final_paths.push(final_path);
@@ -206,14 +196,12 @@ impl ShareOutputTransaction {
     fn commit(&mut self) -> Result<(), String> {
         // Detect existing destinations before publishing any share.
         for final_path in &self.final_paths {
-            if path_entry_exists(final_path)
-                .map_err(|error| {
-                    format!(
-                        "Cannot inspect destination {}: {error}",
-                        final_path.display()
-                    )
-                })?
-            {
+            if path_entry_exists(final_path).map_err(|error| {
+                format!(
+                    "Cannot inspect destination {}: {error}",
+                    final_path.display()
+                )
+            })? {
                 return Err(format!(
                     "Refusing to overwrite existing output: {}",
                     final_path.display()
@@ -399,13 +387,10 @@ async fn split_action(
     }
 
     if total_shares == 0 || threshold == 0 || threshold > total_shares {
-        return Err(
-            "Invalid threshold: require 1 <= threshold <= total shares.".to_string(),
-        );
+        return Err("Invalid threshold: require 1 <= threshold <= total shares.".to_string());
     }
 
-    let (input_path, output_path, total_bytes) =
-        validate_split_paths(&input_dir, &output_dir)?;
+    let (input_path, output_path, total_bytes) = validate_split_paths(&input_dir, &output_dir)?;
 
     let _ = app.emit(
         "status-msg",
@@ -413,12 +398,7 @@ async fn split_action(
     );
 
     let final_paths: Vec<PathBuf> = (1..=total_shares)
-        .map(|index| {
-            output_path.join(format!(
-                "{}.part{}.ombracrx",
-                vault_name, index
-            ))
-        })
+        .map(|index| output_path.join(format!("{}.part{}.ombracrx", vault_name, index)))
         .collect();
 
     // Preflight all final paths before creating any temporary output.
@@ -438,10 +418,7 @@ async fn split_action(
     let mut output_files = Vec::with_capacity(total_shares as usize);
 
     for final_path in final_paths {
-        let file = transaction.create_partial(
-            &output_path,
-            final_path.clone(),
-        )?;
+        let file = transaction.create_partial(&output_path, final_path.clone())?;
 
         output_files.push(ProgressWriter {
             inner: file,
@@ -455,13 +432,8 @@ async fn split_action(
     }
 
     // If the split fails, the temporary output transaction is dropped.
-    split_directory(
-        &input_path,
-        output_files,
-        threshold,
-        total_shares,
-    )
-    .map_err(|error| format!("Encryption failed: {error}"))?;
+    split_directory(&input_path, output_files, threshold, total_shares)
+        .map_err(|error| format!("Encryption failed: {error}"))?;
 
     transaction.commit()?;
 
@@ -500,14 +472,12 @@ async fn restore_action(
     let total_bytes = first_share_metadata.len();
 
     for (index, path) in share_paths.iter().enumerate() {
-        let mut file = File::open(path)
-            .map_err(|error| format!("Failed to open share {path}: {error}"))?;
+        let mut file =
+            File::open(path).map_err(|error| format!("Failed to open share {path}: {error}"))?;
 
         // The file cursor remains immediately after its complete header.
         let header = ShareHeader::read_from(&mut file)
-            .map_err(|error| {
-                format!("Invalid share header in {path}: {error}")
-            })?;
+            .map_err(|error| format!("Invalid share header in {path}: {error}"))?;
 
         if !seen_indexes.insert(header.share_index) {
             return Err(format!(
@@ -528,10 +498,7 @@ async fn restore_action(
             || header.total_shares != expected_total_shares
             || header.base_nonce_prefix != base_nonce_prefix
         {
-            return Err(
-                "Share mismatch: files do not belong to the same bundle."
-                    .to_string(),
-            );
+            return Err("Share mismatch: files do not belong to the same bundle.".to_string());
         }
 
         key_share_data.push(header.ssss_share_data.clone());
@@ -547,9 +514,7 @@ async fn restore_action(
     }
 
     let master_key = reconstruct_key(&key_share_data, threshold)
-        .map_err(|error| {
-            format!("Failed to reconstruct the master key: {error}")
-        })?;
+        .map_err(|error| format!("Failed to reconstruct the master key: {error}"))?;
 
     // Only after key reconstruction can we authenticate each individual
     // header, including its own Shamir fragment and share index.
@@ -568,8 +533,8 @@ async fn restore_action(
     );
 
     let target_dest = Path::new(&output_dir);
-    let share_file = active_share_file
-        .ok_or_else(|| "Could not open a share for restoration.".to_string())?;
+    let share_file =
+        active_share_file.ok_or_else(|| "Could not open a share for restoration.".to_string())?;
 
     let progress_reader = ProgressReader {
         inner: share_file,
@@ -592,9 +557,12 @@ async fn restore_action(
     .map_err(|error| format!("Restoration failed: {error}"))?;
 
     let _ = app.emit("status-msg", "Decryption has been finished.");
-    
+
     // Pass the exact destination to the UI
-    Ok(format!("Success: Files restored to\n{}", restored_path.display()))
+    Ok(format!(
+        "Success: Files restored to\n{}",
+        restored_path.display()
+    ))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -602,10 +570,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![
-            split_action,
-            restore_action
-        ])
+        .invoke_handler(tauri::generate_handler![split_action, restore_action])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
@@ -624,10 +589,7 @@ mod tests {
 
         fs::create_dir_all(&output).unwrap();
 
-        let result = validate_split_paths(
-            source.to_str().unwrap(),
-            output.to_str().unwrap(),
-        );
+        let result = validate_split_paths(source.to_str().unwrap(), output.to_str().unwrap());
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("outside the source"));
@@ -642,9 +604,7 @@ mod tests {
 
         let mut transaction = ShareOutputTransaction::new();
 
-        let mut file = transaction
-            .create_partial(output, final_path)
-            .unwrap();
+        let mut file = transaction.create_partial(output, final_path).unwrap();
 
         file.write_all(b"partial encrypted share").unwrap();
         drop(file);
@@ -666,16 +626,15 @@ mod tests {
 
         let mut transaction = ShareOutputTransaction::new();
 
-        assert!(transaction
-            .create_partial(output, final_path.clone())
-            .is_err());
+        assert!(
+            transaction
+                .create_partial(output, final_path.clone())
+                .is_err()
+        );
 
         drop(transaction);
 
-        assert_eq!(
-            fs::read(&final_path).unwrap(),
-            b"keep this file"
-        );
+        assert_eq!(fs::read(&final_path).unwrap(), b"keep this file");
 
         assert_eq!(fs::read_dir(output).unwrap().count(), 1);
     }
@@ -710,5 +669,32 @@ mod tests {
 
         assert!(!final_one.exists());
         assert_eq!(fs::read(&final_two).unwrap(), b"external file");
+    }
+
+    #[test]
+    fn rollback_cleans_up_previously_published_files_on_mid_commit_failure() {
+        let temp = tempdir().unwrap();
+        let output = temp.path();
+
+        let published_one = output.join("vault.part1.ombracrx");
+        let published_two = output.join("vault.part2.ombracrx");
+
+        // Simulate files that were successfully written to the drive
+        fs::write(&published_one, b"successfully published share 1").unwrap();
+        fs::write(&published_two, b"successfully published share 2").unwrap();
+
+        let mut transaction = ShareOutputTransaction::new();
+
+        // Inject them directly into the published paths tracker to simulate a mid-commit state
+        transaction.published_paths.push(published_one.clone());
+        transaction.published_paths.push(published_two.clone());
+
+        // Trigger the rollback manually (which mimics a failure on a subsequent file)
+        let errors = transaction.rollback_published();
+
+        // Verify the rollback executed flawlessly and shredded the exposed files
+        assert!(errors.is_empty());
+        assert!(!published_one.exists());
+        assert!(!published_two.exists());
     }
 }

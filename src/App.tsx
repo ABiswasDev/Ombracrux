@@ -93,8 +93,11 @@ function App() {
     resetProgress();
     setRestoreStatus("");
     try {
-      await invoke("restore_action", { sharePaths, outputDir: restoreOutputDir });
-      setRestoreStatus("Success: Files restored perfectly.");
+      const result = await invoke<string>("restore_action", {
+      sharePaths,
+      outputDir: restoreOutputDir,
+    });
+    setRestoreStatus(result);
     } catch (err) {
       setRestoreStatus(`Error: ${err}`);
       setProcessMsg("Operation failed.");
