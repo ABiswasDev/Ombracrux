@@ -672,29 +672,39 @@ mod tests {
     }
 
     #[test]
-    fn rollback_cleans_up_previously_published_files_on_mid_commit_failure() {
+    fn commit_rolls_back_first_share_when_later_publication_fails() {
         let temp = tempdir().unwrap();
         let output = temp.path();
 
-        let published_one = output.join("vault.part1.ombracrx");
-        let published_two = output.join("vault.part2.ombracrx");
+        let final_one = output.join("vault.part1.ombracrx");
 
-        // Simulate files that were successfully written to the drive
-        fs::write(&published_one, b"successfully published share 1").unwrap();
-        fs::write(&published_two, b"successfully published share 2").unwrap();
+        // This parent directory deliberately does not exist.
+        // The second publication will therefore fail after the first succeeds.
+        let final_two = output.join("missing_parent").join("vault.part2.ombracrx");
 
         let mut transaction = ShareOutputTransaction::new();
 
-        // Inject them directly into the published paths tracker to simulate a mid-commit state
-        transaction.published_paths.push(published_one.clone());
-        transaction.published_paths.push(published_two.clone());
+        let mut file_one = transaction
+            .create_partial(output, final_one.clone())
+            .unwrap();
+        file_one.write_all(b"first share").unwrap();
+        drop(file_one);
 
-        // Trigger the rollback manually (which mimics a failure on a subsequent file)
-        let errors = transaction.rollback_published();
+        let mut file_two = transaction
+            .create_partial(output, final_two.clone())
+            .unwrap();
+        file_two.write_all(b"second share").unwrap();
+        drop(file_two);
 
-        // Verify the rollback executed flawlessly and shredded the exposed files
-        assert!(errors.is_empty());
-        assert!(!published_one.exists());
-        assert!(!published_two.exists());
+        let error = transaction.commit().unwrap_err();
+
+        assert!(
+            error.contains("Earlier published shares were rolled back"),
+            "Unexpected error: {error}"
+        );
+
+        assert!(!final_one.exists());
+        assert!(!final_two.exists());
+        assert_eq!(fs::read_dir(output).unwrap().count(), 0);
     }
 }

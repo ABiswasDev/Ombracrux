@@ -268,4 +268,23 @@ mod tests {
 
         assert!(header.verify_auth(&[43u8; 32]).is_err());
     }
+
+    #[test]
+    fn modified_serialized_header_tag_fails_authentication() {
+        let key = [42u8; 32];
+        let mut header = sample_header();
+
+        header.sign(&key).unwrap();
+
+        let mut serialized = Vec::new();
+        header.write_to(&mut serialized).unwrap();
+
+        // The authentication tag occupies the final 32 bytes.
+        let last_byte = serialized.len() - 1;
+        serialized[last_byte] ^= 0x01;
+
+        let decoded = ShareHeader::read_from(Cursor::new(serialized)).unwrap();
+
+        assert!(decoded.verify_auth(&key).is_err());
+    }
 }
