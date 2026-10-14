@@ -44,7 +44,7 @@ pub fn split_directory<W: Write>(
         let share_index = u8::try_from(index + 1)
             .map_err(|_| anyhow!("Share index exceeds the supported range"))?;
 
-        let header = ShareHeader {
+        let mut header = ShareHeader {
             magic: *MAGIC_BYTES,
             version: FORMAT_VERSION,
             bundle_id,
@@ -53,13 +53,15 @@ pub fn split_directory<W: Write>(
             share_index,
             base_nonce_prefix,
             ssss_share_data: key_shares[index].clone(),
+            header_auth: [0u8; 32],
         };
 
+        // Each share authenticates its own metadata and Shamir fragment.
+        header.sign(&*master_key)?;
         header.write_to(&mut *file)?;
     }
 
-    // 1 MiB archive chunks with a channel capacity of two.
-    // No plaintext TAR intermediate is written to disk.
+    // Bounded-memory TAR streaming. No plaintext TAR file is created.
     let receiver = stream_directory_to_memory(src_dir, 1024 * 1024);
 
     encrypt_pipeline(

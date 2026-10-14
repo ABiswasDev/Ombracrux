@@ -1,3 +1,4 @@
+
 [package]
 name = "ombracrux-core"
 version = "0.1.0"
@@ -12,3 +13,9 @@ anyhow = "1.0"
 rand = "0.8"
 byteorder = "1.5.0"
 tar = "0.4.46"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

@@ -295,7 +295,7 @@ pub fn restore_pipeline<R: Read>(
     bundle_id: [u8; 16],
     base_nonce_prefix: [u8; 16],
     output_root: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
     if !output_root.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -347,5 +347,5 @@ pub fn restore_pipeline<R: Read>(
         return Err(Box::new(error));
     }
 
-    Ok(())
+    Ok(final_path)
 }
