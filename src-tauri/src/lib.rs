@@ -392,10 +392,7 @@ async fn split_action(
 
     let (input_path, output_path, total_bytes) = validate_split_paths(&input_dir, &output_dir)?;
 
-    let _ = app.emit(
-        "status-msg",
-        "Streaming directory into authenticated threshold shares...",
-    );
+    let _ = app.emit("status-msg", "Generating encrypted shares...");
 
     let final_paths: Vec<PathBuf> = (1..=total_shares)
         .map(|index| output_path.join(format!("{}.part{}.ombracrx", vault_name, index)))
@@ -447,10 +444,7 @@ async fn restore_action(
     share_paths: Vec<String>,
     output_dir: String,
 ) -> Result<String, String> {
-    let _ = app.emit(
-        "status-msg",
-        "Validating share headers and reconstructing the key...",
-    );
+    let _ = app.emit("status-msg", "Verifying & Restoring files...");
 
     if share_paths.is_empty() {
         return Err("No shares provided for restoration.".to_string());
@@ -527,11 +521,6 @@ async fn restore_action(
         })?;
     }
 
-    let _ = app.emit(
-        "status-msg",
-        "Headers authenticated. Decrypting and restoring...",
-    );
-
     let target_dest = Path::new(&output_dir);
     let share_file =
         active_share_file.ok_or_else(|| "Could not open a share for restoration.".to_string())?;
@@ -555,8 +544,6 @@ async fn restore_action(
         target_dest,
     )
     .map_err(|error| format!("Restoration failed: {error}"))?;
-
-    let _ = app.emit("status-msg", "Decryption has been finished.");
 
     // Pass the exact destination to the UI
     Ok(format!(
