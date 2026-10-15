@@ -239,7 +239,7 @@ function App() {
       {tab === "restore" && (
         <div className="panel">
           <div className="input-group">
-            <label>Input Folder</label>
+            <label>Input Shares</label>
             <div className="file-picker">
               <input
                 type="text"

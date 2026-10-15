@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Ombracrux is currently in active R&D. Only the latest experimental release (v0.1.x) receives security patches. 
+Ombracrux is currently in active R&D. Latest release receives security patches. 
 
 ## Reporting a Vulnerability
 
