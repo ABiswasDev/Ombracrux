@@ -63,7 +63,7 @@ You do not need a background in cryptography to use Ombracrux. Think of Ombracru
 ### How to Recover a Folder (`Restore` Tab)
 
 1. **Switch to the Restore Tab:** Click **Restore** at the top of the window.
-2. **Select Your Share Files:** Click **Browse** next to **Input Folder** and select at least $T$ (your threshold number) of the `.ombracrx` share files belonging to the same vault (hold `Ctrl` or `Shift` in the file picker to select multiple `.ombracrx` files at once).
+2. **Select Your Share Files:** Click **Browse** next to **Input Shares** and select at least $T$ (your threshold number) of the `.ombracrx` share files belonging to the same vault (hold `Ctrl` or `Shift` in the file picker to select multiple `.ombracrx` files at once).
 3. **Select Your Output Folder:** Click **Browse** next to **Output Folder** and choose the destination folder where your recovered files should be placed.
 4. **Recover & Unpack:** Click **Recover & Unpack**.
    * Ombracrux will verify the headers of all selected shares, reconstruct the master encryption key, and decrypt the archive stream into a new folder named `Ombracrux-Restored-<id>` inside your chosen Output Folder.
@@ -236,7 +236,7 @@ Ombracrux is source-available software licensed under the **[PolyForm Noncommerc
 Required Notice: Copyright (c) 2026 Abhishek Biswas (https://github.com/ABiswasDev/Ombracrux)
 
 ### Trademark & Branding Policy
-The names **"Ombracrux"**, **"Ombracrypt"**, **"Ombraveil"**, and all associated logos, emblems, and visual identifiers are proprietary trademarks of **Abhishek Biswas**. While the source code is made available under the PolyForm Noncommercial License 1.0.0, **no license or right to use these trademarks is granted**:
+The names **"Ombracrux"**, a part of **"Ombraveil"** Research entity, and all associated logos, emblems, and visual identifiers are proprietary trademarks of **Abhishek Biswas**. While the source code is made available under the PolyForm Noncommercial License 1.0.0, **no license or right to use these trademarks is granted**:
 
-* **No Rebranding as Official Releases:** You may not distribute modified versions or forks of this software under the names "Ombracrux", "Ombracrypt", or "Ombraveil", or use confusingly similar names or logos that imply endorsement by or affiliation with Abhishek Biswas.
+* **No Rebranding as Official Releases:** You may not distribute modified versions or forks of this software under the names "Ombracrux", or "Ombraveil", or use confusingly similar names or logos that imply endorsement by or affiliation with **Abhishek Biswas**(https://www.linkedin.com/in/abby33459/).
 * **Attribution Required on Forks:** Any permitted non-commercial fork or modified redistribution must retain the `Required Notice` above and clearly state that it is an unofficial modification.
