@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Shamir Threshold Archive Engine</strong><br>
-  <em>Threshold-Bound Encrypted Archive Storage</em>
+  <em>Encrypt sensitive files Lord Voldemort style.</em>
 </p>
 
 <p align="center">
@@ -73,7 +73,7 @@ You do not need a background in cryptography to use Ombracrux. Think of Ombracru
 
 ## Origins & Design
 
-Ombracrux is an independent **Rust** and **Tauri** desktop implementation inspired by the threshold-based file recovery concept demonstrated by [Horcrux](https://github.com/jesseduffield/horcrux) (created by Jesse Duffield).
+Ombracrux is an independent implementation using **Rust** and **Tauri** to develop a smooth GUI-based cross-platform desktop application inspired by the threshold-based file recovery concept demonstrated by [Horcrux](https://github.com/jesseduffield/horcrux) (created by Jesse Duffield).
 
 While sharing the conceptual workflow of threshold secret recovery, Ombracrux uses its own Rust architecture (`ombracrux-core`) and extends the concept with:
 1. **Directory Streaming:** On-the-fly in-memory directory archiving (`archive.rs`) rather than single-file wrapping.
@@ -116,7 +116,7 @@ Ombracrux is engineered to protect data at rest against specific physical, opera
 Users should understand the operational boundaries of the current implementation:
 
 * **Payload Reading Scope During Recovery:** When $T$ or more shares are supplied for restoration, Ombracrux cryptographically authenticates the headers of **all supplied shares**. However, the encrypted archive payload is streamed and verified from the **first selected share**; payload bytes in the remaining supplied shares are not automatically tried as a fallback during the same restoration attempt.
-* **Irrecoverable Loss Below the Threshold:** There are no backdoors, master recovery keys, or escrow mechanisms. If you configure a $3$-of-$5$ split and permanently lose $3$ shares, your data cannot be recovered.
+* **Irrecoverable Loss Below the Threshold:** There are no backdoors, master recovery keys, or escrow mechanisms. If you configure a 3-of-5 split and permanently lose 3 shares, your data cannot be recovered.
 * **Plaintext Staging During Restoration & Deletion Semantics:** During restoration, files are unpacked into a hidden `.ombracrx-restore-*.tmp` staging directory inside the output folder (created with `0700` permissions on Unix systems; Windows uses standard inherited directory ACLs) before the final closure record is reached. If verification fails, Ombracrux attempts to delete the staging directory via standard OS file removal (`remove_dir_all`), which unlinks files but does not guarantee physical block erasure on wear-leveled SSDs, and cannot run if the process is terminated abruptly (`SIGKILL` or power loss).
 * **Multi-File Publication Boundaries:** Publishing multiple separate `.ombracrx` share files cannot be globally atomic at the OS filesystem level. While `ShareOutputTransaction` performs best-effort rollback of earlier shares if a later rename fails during commit, sudden power loss mid-commit can leave a partial set of shares on disk.
 * **Compromised Host OS & Webview Configuration (Out of Scope):** Ombracrux assumes the host operating system is trusted during split and restore operations. It cannot defend against active kernel rootkits, memory scrapers, or keyloggers on a compromised machine. In addition, the Tauri webview currently operates with `csp: null` and has not undergone a dedicated webview-hardening or independent cryptographic audit.
