@@ -119,7 +119,7 @@ Users should understand the operational boundaries of the current implementation
 * **Irrecoverable Loss Below the Threshold:** There are no backdoors, master recovery keys, or escrow mechanisms. If you configure a 3-of-5 split and permanently lose 3 shares, your data cannot be recovered.
 * **Plaintext Staging During Restoration & Deletion Semantics:** During restoration, files are unpacked into a hidden `.ombracrx-restore-*.tmp` staging directory inside the output folder (created with `0700` permissions on Unix systems; Windows uses standard inherited directory ACLs) before the final closure record is reached. If verification fails, Ombracrux attempts to delete the staging directory via standard OS file removal (`remove_dir_all`), which unlinks files but does not guarantee physical block erasure on wear-leveled SSDs, and cannot run if the process is terminated abruptly (`SIGKILL` or power loss).
 * **Multi-File Publication Boundaries:** Publishing multiple separate `.ombracrx` share files cannot be globally atomic at the OS filesystem level. While `ShareOutputTransaction` performs best-effort rollback of earlier shares if a later rename fails during commit, sudden power loss mid-commit can leave a partial set of shares on disk.
-* **Compromised Host OS & Webview Configuration (Out of Scope):** Ombracrux assumes the host operating system is trusted during split and restore operations. It cannot defend against active kernel rootkits, memory scrapers, or keyloggers on a compromised machine. In addition, the Tauri webview currently operates with `csp: null` and has not undergone a dedicated webview-hardening or independent cryptographic audit.
+* **Compromised Host OS (Out of Scope):** Ombracrux assumes the host operating system is trusted during split and restore operations. It cannot defend against active kernel rootkits, memory scrapers, or keyloggers on a compromised machine, and has not undergone an independent cryptographic audit.
 
 ---
 
@@ -187,34 +187,41 @@ npm run tauri build
 ## Project Structure
 
 ```plaintext
-ombracrux/
+Ombracrux/
 ├── .github/workflows/
-│   ├── ci.yml                # Automated formatting, check, and test verification on push/PR
-│   └── release.yml           # Cross-platform release bundler triggered on version tags
-├── LICENSE                   # Verbatim PolyForm Noncommercial License 1.0.0 terms
-├── TRADEMARKS.md             # Trademark and branding reservation policy
-├── package.json              # Frontend dependencies and build scripts
-├── src/                      # Frontend Presentation Layer (React / TypeScript)
-│   ├── App.tsx               # Fixed-viewport UI, state management, and Tauri IPC bridge
-│   ├── App.css               # Obsidian & Spectral Emerald theme styling
-│   └── main.tsx              # React DOM entry point
-└── src-tauri/                # Rust Backend & Cryptographic Workspace
-    ├── Cargo.toml            # Tauri application manifest
-    ├── tauri.conf.json       # Window geometry and bundler configuration
+│   ├── ci.yml                  # Automated formatting, check, and test verification
+│   └── release.yml             # Cross-platform release bundler
+├── LICENSE                     # PolyForm Noncommercial License 1.0.0 terms
+├── README.md                   # Project documentation and user guide
+├── SECURITY.md                 # Security policy and vulnerability reporting
+├── index.html                  # Webview entry document
+├── package.json                # Frontend dependencies and build scripts
+├── vite.config.ts              # Vite bundler configuration
+├── src/                        # Frontend Presentation Layer (React / TypeScript)
+│   ├── App.tsx                 # Fixed-viewport UI, state management, and IPC bridge
+│   ├── App.css                 # Obsidian & Spectral Emerald theme styling
+│   └── main.tsx                # React DOM entry point
+└── src-tauri/                  # Rust Backend & Cryptographic Workspace
+    ├── Cargo.toml              # Tauri application manifest
+    ├── tauri.conf.json         # Window geometry, security, and bundler configuration
+    ├── capabilities/
+    │   └── default.json        # Tauri v2 permission scopes (dialog, opener)
+    ├── icons/                  # Application bundle icons
     ├── src/
-    │   ├── lib.rs            # IPC commands, path validation, and ShareOutputTransaction
-    │   └── main.rs           # Application binary entry point
-    └── crates/core/          # Cryptographic Engine (ombracrux-core)
-        ├── Cargo.toml        # Isolated crypto dependencies (sharks, chacha20poly1305, hkdf, hmac)
+    │   ├── lib.rs              # IPC command router, path validation, and staging transactions
+    │   └── main.rs             # Application binary entry point
+    └── crates/core/            # Independent Cryptographic Engine (ombracrux-core)
+        ├── Cargo.toml          # Isolated crypto dependencies (sharks, chacha20poly1305, hkdf, hmac)
         ├── src/
-        │   ├── archive.rs    # Bounded-memory ChannelWriter TAR streaming producer
-        │   ├── crypto.rs     # Chunk-indexed XChaCha20-Poly1305 encryption pipeline
-        │   ├── format.rs     # Binary share header serialization & HMAC-SHA256 authentication
-        │   ├── restore.rs    # Authenticated stream decryption & staged directory unpacking
-        │   ├── shares.rs     # Shamir's Secret Sharing (GF(2^8)) key split & recovery
-        │   └── split.rs      # High-level directory split orchestrator
+        │   ├── lib.rs          # Core crate exports and public API
+        │   ├── archive.rs      # Bounded-memory ChannelWriter TAR streaming producer
+        │   ├── crypto.rs       # Chunk-indexed XChaCha20-Poly1305 encryption pipeline
+        │   ├── format.rs       # Binary share header serialization & HMAC-SHA256 authentication
+        │   ├── restore.rs      # Authenticated stream decryption & staged directory unpacking
+        │   ├── shares.rs       # Shamir's Secret Sharing (GF(2^8)) key split & recovery
+        │   └── split.rs        # High-level directory split orchestrator
         └── tests/
-            └── streaming.rs  # End-to-end tampering, truncation, and restoration test suite
+            └── streaming.rs    # End-to-end tampering, truncation, and restoration test suite
 ```
 
 ---

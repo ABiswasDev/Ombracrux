@@ -214,7 +214,7 @@ impl ShareOutputTransaction {
                 .take()
                 .ok_or_else(|| "Missing temporary share file".to_string())?;
 
-            // FIX: Clone the path to avoid borrowing `self` immutably
+            // Clone the path to avoid borrowing `self` immutably
             let final_path = self.final_paths[index].clone();
 
             match temporary.persist_noclobber(&final_path) {
@@ -267,7 +267,7 @@ impl Drop for ShareOutputTransaction {
 
 struct ProgressWriter<'a> {
     inner: File,
-    app: &'a AppHandle,
+    app: Option<&'a AppHandle>,
     total_bytes: u64,
     bytes_written: u64,
     start_time: Instant,
@@ -280,14 +280,16 @@ impl Write for ProgressWriter<'_> {
         let count = self.inner.write(buf)?;
         self.bytes_written += count as u64;
 
-        emit_progress(
-            self.app,
-            self.event_name,
-            self.bytes_written,
-            self.total_bytes,
-            &mut self.last_emit,
-            &self.start_time,
-        );
+        if let Some(app) = self.app {
+            emit_progress(
+                app,
+                self.event_name,
+                self.bytes_written,
+                self.total_bytes,
+                &mut self.last_emit,
+                &self.start_time,
+            );
+        }
 
         Ok(count)
     }
@@ -337,7 +339,7 @@ fn emit_progress(
     last_emit: &mut Instant,
     start_time: &Instant,
 ) {
-    if last_emit.elapsed().as_millis() > 50 || current >= total {
+    if last_emit.elapsed().as_millis() >= 50 {
         let elapsed = start_time.elapsed().as_secs_f64();
 
         let speed = if elapsed > 0.0 {
@@ -353,7 +355,7 @@ fn emit_progress(
         };
 
         let percent = if total > 0 {
-            ((current as f64 / total as f64) * 100.0).min(100.0)
+            ((current as f64 / total as f64) * 100.0).min(99.0)
         } else {
             0.0
         };
@@ -414,12 +416,12 @@ async fn split_action(
     let start_time = Instant::now();
     let mut output_files = Vec::with_capacity(total_shares as usize);
 
-    for final_path in final_paths {
-        let file = transaction.create_partial(&output_path, final_path.clone())?;
+    for (index, final_path) in final_paths.into_iter().enumerate() {
+        let file = transaction.create_partial(&output_path, final_path)?;
 
         output_files.push(ProgressWriter {
             inner: file,
-            app: &app,
+            app: if index == 0 { Some(&app) } else { None },
             total_bytes,
             bytes_written: 0,
             start_time,
@@ -434,6 +436,13 @@ async fn split_action(
 
     transaction.commit()?;
 
+    let _ = app.emit(
+        "split-progress",
+        ProgressPayload {
+            percent: 100.0,
+            eta_seconds: 0.0,
+        },
+    );
     let _ = app.emit("status-msg", "Encryption has been finished.");
     Ok("Split successful".to_string())
 }
@@ -544,6 +553,14 @@ async fn restore_action(
         target_dest,
     )
     .map_err(|error| format!("Restoration failed: {error}"))?;
+
+    let _ = app.emit(
+        "restore-progress",
+        ProgressPayload {
+            percent: 100.0,
+            eta_seconds: 0.0,
+        },
+    );
 
     // Pass the exact destination to the UI
     Ok(format!(
