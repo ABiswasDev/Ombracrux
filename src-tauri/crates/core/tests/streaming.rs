@@ -70,7 +70,7 @@ fn create_test_vault(source: &Path) -> TestVault {
         shares,
         headers,
         header_lengths,
-        master_key,
+        master_key: *master_key,
     }
 }
 

@@ -9,7 +9,7 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
 use ombracrux_core::format::ShareHeader;
 use ombracrux_core::restore::restore_pipeline;
-use ombracrux_core::shares::reconstruct_key;
+use ombracrux_core::shares::{Zeroizing, reconstruct_key};
 use ombracrux_core::split::split_directory;
 
 #[derive(Clone, serde::Serialize)]
@@ -516,7 +516,7 @@ async fn restore_action(
         ));
     }
 
-    let master_key = reconstruct_key(&key_share_data, threshold)
+    let master_key: Zeroizing<[u8; 32]> = reconstruct_key(&key_share_data, threshold)
         .map_err(|error| format!("Failed to reconstruct the master key: {error}"))?;
 
     // Only after key reconstruction can we authenticate each individual
