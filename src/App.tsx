@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
@@ -8,11 +8,22 @@ interface PreflightPayload {
   files_scanned: number;
   dirs_scanned: number;
   source_bytes: number;
+  total_tar_bytes: number;
   shares_to_create: number;
   estimated_share_bytes: number;
   estimated_total_output_bytes: number;
   available_output_bytes: number | null;
   insufficient_space: boolean;
+}
+
+const SHARE_HEADER_BYTES = 112;
+const STREAM_CHUNK_SIZE = 1024 * 1024;
+const CHUNK_FRAMING_OVERHEAD = 20;
+
+function computeShareBytes(totalTarBytes: number): number {
+  const dataChunks = Math.max(1, Math.ceil(totalTarBytes / STREAM_CHUNK_SIZE));
+  const framingBytes = (dataChunks + 1) * CHUNK_FRAMING_OVERHEAD;
+  return SHARE_HEADER_BYTES + totalTarBytes + framingBytes;
 }
 
 function formatBytes(bytes: number): string {
@@ -43,8 +54,9 @@ function App() {
   const [totalShares, setTotalShares] = useState(5);
   const [splitStatus, setSplitStatus] = useState("");
 
-  // Preflight Preview State
-  const [preflight, setPreflight] = useState<PreflightPayload | null>(null);
+  // Preflight Preview State (scanned once per inputDir)
+  const [baseScan, setBaseScan] = useState<PreflightPayload | null>(null);
+  const [availableOutputBytes, setAvailableOutputBytes] = useState<number | null>(null);
   const [preflightError, setPreflightError] = useState("");
 
   // Restore State
@@ -72,9 +84,10 @@ function App() {
     };
   }, []);
 
+  // Scan the source directory ONLY when `inputDir` changes.
   useEffect(() => {
-    if (!inputDir || totalShares < 2 || totalShares > 255) {
-      setPreflight(null);
+    if (!inputDir) {
+      setBaseScan(null);
       setPreflightError("");
       return;
     }
@@ -84,17 +97,20 @@ function App() {
     invoke<PreflightPayload>("preview_split", {
       inputDir,
       outputDir: outputDir || null,
-      totalShares,
+      totalShares: 2,
     })
       .then((report) => {
         if (!cancelled) {
-          setPreflight(report);
+          setBaseScan(report);
+          if (outputDir) {
+            setAvailableOutputBytes(report.available_output_bytes);
+          }
           setPreflightError("");
         }
       })
       .catch((err) => {
         if (!cancelled) {
-          setPreflight(null);
+          setBaseScan(null);
           setPreflightError(String(err));
         }
       });
@@ -102,7 +118,54 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [inputDir, outputDir, totalShares]);
+  }, [inputDir]);
+
+  // Query destination free space ONLY when `outputDir` changes (without re-scanning `inputDir`).
+  useEffect(() => {
+    if (!outputDir) {
+      setAvailableOutputBytes(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    invoke<number | null>("check_output_space", { outputDir })
+      .then((avail) => {
+        if (!cancelled) {
+          setAvailableOutputBytes(avail);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setAvailableOutputBytes(null);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [outputDir]);
+
+  // Recalculate share and total output arithmetic in O(1) memory when `totalShares` or `outputDir` changes.
+  const preflight = useMemo<PreflightPayload | null>(() => {
+    if (!baseScan || totalShares < 2 || totalShares > 255) {
+      return null;
+    }
+
+    const estimatedShareBytes = computeShareBytes(baseScan.total_tar_bytes);
+    const estimatedTotalOutputBytes = estimatedShareBytes * totalShares;
+    const insufficientSpace =
+      availableOutputBytes !== null && estimatedTotalOutputBytes > availableOutputBytes;
+
+    return {
+      ...baseScan,
+      shares_to_create: totalShares,
+      estimated_share_bytes: estimatedShareBytes,
+      estimated_total_output_bytes: estimatedTotalOutputBytes,
+      available_output_bytes: availableOutputBytes,
+      insufficient_space: insufficientSpace,
+    };
+  }, [baseScan, totalShares, availableOutputBytes]);
 
   const handleTabChange = (nextTab: "split" | "restore") => {
     if (isProcessing) return;
@@ -280,9 +343,12 @@ function App() {
             <div className={`preflight-card ${preflight.insufficient_space ? "warn-border" : ""}`}>
               <div className="preflight-header">
                 <span className="preflight-title">Preflight Report</span>
-                {preflight.available_output_bytes !== null && (
+                {outputDir && (
                   <span className="preflight-badge">
-                    Destination Free: {formatBytes(preflight.available_output_bytes)}
+                    Destination Free:{" "}
+                    {preflight.available_output_bytes !== null
+                      ? formatBytes(preflight.available_output_bytes)
+                      : "Unavailable"}
                   </span>
                 )}
               </div>
@@ -320,8 +386,9 @@ function App() {
               )}
 
               <div className="preflight-note">
-                Includes in-memory TAR headers, 512B block alignment, and stream framing (~
-                {formatBytes(preflight.estimated_share_bytes)} per share).
+                Estimates (~{formatBytes(preflight.estimated_share_bytes)} per share) include TAR
+                headers, 512B alignment, and stream framing; actual size may vary slightly with
+                metadata.
               </div>
             </div>
           )}
@@ -333,7 +400,13 @@ function App() {
           <button
             className="primary-btn"
             onClick={handleSplit}
-            disabled={isProcessing || Boolean(preflight?.insufficient_space)}
+            disabled={
+              isProcessing ||
+              Boolean(preflightError) ||
+              Boolean(preflight?.insufficient_space) ||
+              totalShares < 2 ||
+              totalShares > 255
+            }
           >
             {isProcessing ? "Processing..." : "Create Secure Shares"}
           </button>

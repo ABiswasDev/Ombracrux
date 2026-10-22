@@ -9,6 +9,7 @@ use tauri::{AppHandle, Emitter};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
 use ombracrux_core::format::ShareHeader;
+use ombracrux_core::preflight::{PreflightReport, scan_preflight};
 use ombracrux_core::restore::restore_pipeline;
 use ombracrux_core::shares::{Zeroizing, reconstruct_key};
 use ombracrux_core::split::split_directory;
@@ -24,19 +25,12 @@ struct PreflightPayload {
     files_scanned: u64,
     dirs_scanned: u64,
     source_bytes: u64,
+    total_tar_bytes: u64,
     shares_to_create: u8,
     estimated_share_bytes: u64,
     estimated_total_output_bytes: u64,
     available_output_bytes: Option<u64>,
     insufficient_space: bool,
-}
-
-#[derive(Default)]
-struct ScanStats {
-    files_scanned: u64,
-    dirs_scanned: u64,
-    source_bytes: u64,
-    tar_payload_bytes: u64,
 }
 
 /// Uses symlink_metadata so broken symlinks also count as existing paths.
@@ -48,120 +42,32 @@ fn path_entry_exists(path: &Path) -> IoResult<bool> {
     }
 }
 
-fn scan_directory_tree(path: &Path, stats: &mut ScanStats) -> Result<(), String> {
-    let entries = fs::read_dir(path)
-        .map_err(|error| format!("Cannot read source directory {}: {error}", path.display()))?;
-
-    for entry_result in entries {
-        let entry = entry_result
-            .map_err(|error| format!("Cannot inspect a source directory entry: {error}"))?;
-
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("Cannot inspect {}: {error}", entry.path().display()))?;
-
-        if file_type.is_symlink() {
-            return Err(format!(
-                "Symlinks are not currently supported in source directories: {}",
-                entry.path().display()
-            ));
-        }
-
-        if file_type.is_dir() {
-            stats.dirs_scanned = stats
-                .dirs_scanned
-                .checked_add(1)
-                .ok_or_else(|| "Directory count overflow".to_string())?;
-            stats.tar_payload_bytes = stats
-                .tar_payload_bytes
-                .checked_add(512)
-                .ok_or_else(|| "Archive size estimation overflow".to_string())?;
-
-            scan_directory_tree(&entry.path(), stats)?;
-        } else if file_type.is_file() {
-            let metadata = entry.metadata().map_err(|error| {
-                format!(
-                    "Cannot read metadata for {}: {error}",
-                    entry.path().display()
-                )
-            })?;
-
-            let len = metadata.len();
-            stats.files_scanned = stats
-                .files_scanned
-                .checked_add(1)
-                .ok_or_else(|| "File count overflow".to_string())?;
-            stats.source_bytes = stats
-                .source_bytes
-                .checked_add(len)
-                .ok_or_else(|| "Source directory size overflow".to_string())?;
-
-            let padded_blocks = len
-                .div_ceil(512)
-                .checked_mul(512)
-                .ok_or_else(|| "Archive block alignment overflow".to_string())?;
-            let tar_entry_bytes = 512u64
-                .checked_add(padded_blocks)
-                .ok_or_else(|| "Archive entry size overflow".to_string())?;
-
-            stats.tar_payload_bytes = stats
-                .tar_payload_bytes
-                .checked_add(tar_entry_bytes)
-                .ok_or_else(|| "Archive size estimation overflow".to_string())?;
-        } else {
-            return Err(format!(
-                "Unsupported filesystem entry in source directory: {}",
-                entry.path().display()
-            ));
-        }
+fn reject_symlink_ancestors(input_dir: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(input_dir)
+        .map_err(|error| format!("Cannot inspect source directory: {error}"))?;
+    if meta.file_type().is_symlink() {
+        return Err(format!(
+            "Symlinks are not currently supported as the source directory: {}",
+            input_dir.display()
+        ));
     }
-
+    if !meta.is_dir() {
+        return Err("The source path must be an existing directory".to_string());
+    }
     Ok(())
 }
 
-fn estimate_share_and_total_bytes(
-    tar_payload_bytes: u64,
-    total_shares: u8,
-) -> Result<(u64, u64), String> {
-    // Include root directory TAR header (512B) + TAR EOF marker (1024B)
-    let archive_stream_bytes = tar_payload_bytes
-        .checked_add(1536)
-        .ok_or_else(|| "Archive stream size overflow".to_string())?;
-
-    // 64 KiB encryption chunks with 20-byte framing (4B length + 16B Poly1305 tag) + final EOF frame
-    let chunk_size = 64 * 1024u64;
-    let num_chunks = archive_stream_bytes.div_ceil(chunk_size).max(1);
-    let framing_overhead = num_chunks
-        .checked_add(1)
-        .and_then(|c| c.checked_mul(20))
-        .ok_or_else(|| "Framing overhead overflow".to_string())?;
-
-    // ShareHeader (~120 bytes) + encrypted stream
-    let estimated_share_bytes = archive_stream_bytes
-        .checked_add(framing_overhead)
-        .and_then(|s| s.checked_add(120))
-        .ok_or_else(|| "Estimated share size overflow".to_string())?;
-
-    let estimated_total_output_bytes = estimated_share_bytes
-        .checked_mul(total_shares as u64)
-        .ok_or_else(|| "Total output size overflow".to_string())?;
-
-    Ok((estimated_share_bytes, estimated_total_output_bytes))
-}
-
-/// Calculate input size without following symlinks.
-fn calculate_dir_size(path: &Path) -> Result<u64, String> {
-    let mut stats = ScanStats::default();
-    scan_directory_tree(path, &mut stats)?;
-    Ok(stats.source_bytes)
-}
-
-/// Canonicalize both directories and reject output inside the source tree.
+/// Canonicalize both directories, reject output inside the source tree,
+/// and perform a single unified preflight scan via `ombracrux_core::preflight`.
 fn validate_split_paths(
     input_dir: &str,
     output_dir: &str,
-) -> Result<(PathBuf, PathBuf, u64), String> {
-    let source_path = fs::canonicalize(input_dir)
+    total_shares: u8,
+) -> Result<(PathBuf, PathBuf, PreflightReport), String> {
+    let raw_source = Path::new(input_dir);
+    reject_symlink_ancestors(raw_source)?;
+
+    let source_path = fs::canonicalize(raw_source)
         .map_err(|error| format!("Cannot resolve source directory: {error}"))?;
 
     let output_path = fs::canonicalize(output_dir)
@@ -183,9 +89,9 @@ fn validate_split_paths(
         );
     }
 
-    let total_bytes = calculate_dir_size(&source_path)?;
+    let report = scan_preflight(&source_path, total_shares).map_err(|error| error.to_string())?;
 
-    Ok((source_path, output_path, total_bytes))
+    Ok((source_path, output_path, report))
 }
 
 fn valid_vault_name(name: &str) -> bool {
@@ -193,6 +99,27 @@ fn valid_vault_name(name: &str) -> bool {
         && name.chars().all(|character| {
             character.is_ascii_alphanumeric() || character == '_' || character == '-'
         })
+}
+
+fn query_available_space(output_dir: &Option<String>) -> Option<u64> {
+    match output_dir {
+        Some(dir) if !dir.trim().is_empty() => {
+            let out_path = Path::new(dir);
+            if out_path.exists() {
+                available_space(out_path).ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[tauri::command]
+async fn check_output_space(output_dir: String) -> Result<Option<u64>, String> {
+    tauri::async_runtime::spawn_blocking(move || Ok(query_available_space(&Some(output_dir))))
+        .await
+        .map_err(|error| format!("Disk space check task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -205,45 +132,36 @@ async fn preview_split(
         return Err("Total shares must be between 2 and 255.".to_string());
     }
 
-    let source_path = fs::canonicalize(&input_dir)
-        .map_err(|error| format!("Cannot resolve source directory: {error}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let raw_source = Path::new(&input_dir);
+        reject_symlink_ancestors(raw_source)?;
 
-    if !source_path.is_dir() {
-        return Err("The source path must be an existing directory.".to_string());
-    }
+        let source_path = fs::canonicalize(raw_source)
+            .map_err(|error| format!("Cannot resolve source directory: {error}"))?;
 
-    let mut stats = ScanStats::default();
-    scan_directory_tree(&source_path, &mut stats)?;
+        let report =
+            scan_preflight(&source_path, total_shares).map_err(|error| error.to_string())?;
 
-    let (estimated_share_bytes, estimated_total_output_bytes) =
-        estimate_share_and_total_bytes(stats.tar_payload_bytes, total_shares)?;
+        let available_output_bytes = query_available_space(&output_dir);
 
-    let available_output_bytes = match output_dir {
-        Some(ref dir) if !dir.trim().is_empty() => {
-            let out_path = Path::new(dir);
-            if out_path.exists() {
-                available_space(out_path).ok()
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
+        let insufficient_space = available_output_bytes
+            .map(|avail| report.estimated_total_output_bytes > avail)
+            .unwrap_or(false);
 
-    let insufficient_space = available_output_bytes
-        .map(|avail| estimated_total_output_bytes > avail)
-        .unwrap_or(false);
-
-    Ok(PreflightPayload {
-        files_scanned: stats.files_scanned,
-        dirs_scanned: stats.dirs_scanned,
-        source_bytes: stats.source_bytes,
-        shares_to_create: total_shares,
-        estimated_share_bytes,
-        estimated_total_output_bytes,
-        available_output_bytes,
-        insufficient_space,
+        Ok(PreflightPayload {
+            files_scanned: report.files_scanned,
+            dirs_scanned: report.dirs_scanned,
+            source_bytes: report.source_bytes,
+            total_tar_bytes: report.total_tar_bytes,
+            shares_to_create: report.shares_to_create,
+            estimated_share_bytes: report.estimated_share_bytes,
+            estimated_total_output_bytes: report.estimated_total_output_bytes,
+            available_output_bytes,
+            insufficient_space,
+        })
     })
+    .await
+    .map_err(|error| format!("Preflight scan task failed: {error}"))?
 }
 
 /// Holds hidden temporary files until all encrypted shares are complete.
@@ -505,72 +423,73 @@ async fn split_action(
         return Err("Invalid threshold: require 1 <= threshold <= total shares.".to_string());
     }
 
-    let (input_path, output_path, total_bytes) = validate_split_paths(&input_dir, &output_dir)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        // Single unified directory scan and path validation.
+        let (input_path, output_path, report) =
+            validate_split_paths(&input_dir, &output_dir, total_shares)?;
 
-    let mut stats = ScanStats::default();
-    scan_directory_tree(&input_path, &mut stats)?;
-    let (_, estimated_total_output_bytes) =
-        estimate_share_and_total_bytes(stats.tar_payload_bytes, total_shares)?;
-
-    if let Ok(avail) = available_space(&output_path) {
-        if estimated_total_output_bytes > avail {
-            return Err(format!(
-                "Insufficient disk space on destination drive: requires ~{:.1} GB, but only {:.1} GB is available.",
-                estimated_total_output_bytes as f64 / 1_073_741_824.0,
-                avail as f64 / 1_073_741_824.0
-            ));
+        if let Ok(avail) = available_space(&output_path) {
+            if report.estimated_total_output_bytes > avail {
+                return Err(format!(
+                    "Insufficient disk space on destination drive: requires ~{:.1} GB, but only {:.1} GB is available.",
+                    report.estimated_total_output_bytes as f64 / 1_073_741_824.0,
+                    avail as f64 / 1_073_741_824.0
+                ));
+            }
         }
-    }
 
-    let _ = app.emit("status-msg", "Generating encrypted shares...");
+        let _ = app.emit("status-msg", "Generating encrypted shares...");
 
-    let final_paths: Vec<PathBuf> = (1..=total_shares)
-        .map(|index| output_path.join(format!("{}.part{}.ombracrx", vault_name, index)))
-        .collect();
+        let final_paths: Vec<PathBuf> = (1..=total_shares)
+            .map(|index| output_path.join(format!("{}.part{}.ombracrx", vault_name, index)))
+            .collect();
 
-    for final_path in &final_paths {
-        if path_entry_exists(final_path)
-            .map_err(|error| format!("Cannot inspect output path: {error}"))?
-        {
-            return Err(format!(
-                "Output already exists. Nothing was overwritten: {}",
-                final_path.display()
-            ));
+        for final_path in &final_paths {
+            if path_entry_exists(final_path)
+                .map_err(|error| format!("Cannot inspect output path: {error}"))?
+            {
+                return Err(format!(
+                    "Output already exists. Nothing was overwritten: {}",
+                    final_path.display()
+                ));
+            }
         }
-    }
 
-    let mut transaction = ShareOutputTransaction::new();
-    let start_time = Instant::now();
-    let mut output_files = Vec::with_capacity(total_shares as usize);
+        let mut transaction = ShareOutputTransaction::new();
+        let start_time = Instant::now();
+        let mut output_files = Vec::with_capacity(total_shares as usize);
 
-    for (index, final_path) in final_paths.into_iter().enumerate() {
-        let file = transaction.create_partial(&output_path, final_path)?;
+        for (index, final_path) in final_paths.into_iter().enumerate() {
+            let file = transaction.create_partial(&output_path, final_path)?;
 
-        output_files.push(ProgressWriter {
-            inner: file,
-            app: if index == 0 { Some(&app) } else { None },
-            total_bytes,
-            bytes_written: 0,
-            start_time,
-            last_emit: Instant::now(),
-            event_name: "split-progress",
-        });
-    }
+            output_files.push(ProgressWriter {
+                inner: file,
+                app: if index == 0 { Some(&app) } else { None },
+                total_bytes: report.estimated_share_bytes,
+                bytes_written: 0,
+                start_time,
+                last_emit: Instant::now(),
+                event_name: "split-progress",
+            });
+        }
 
-    split_directory(&input_path, output_files, threshold, total_shares)
-        .map_err(|error| format!("Encryption failed: {error}"))?;
+        split_directory(&input_path, output_files, threshold, total_shares)
+            .map_err(|error| format!("Encryption failed: {error}"))?;
 
-    transaction.commit()?;
+        transaction.commit()?;
 
-    let _ = app.emit(
-        "split-progress",
-        ProgressPayload {
-            percent: 100.0,
-            eta_seconds: 0.0,
-        },
-    );
-    let _ = app.emit("status-msg", "Encryption has been finished.");
-    Ok("Split successful".to_string())
+        let _ = app.emit(
+            "split-progress",
+            ProgressPayload {
+                percent: 100.0,
+                eta_seconds: 0.0,
+            },
+        );
+        let _ = app.emit("status-msg", "Encryption has been finished.");
+        Ok("Split successful".to_string())
+    })
+    .await
+    .map_err(|error| format!("Encryption worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -579,115 +498,119 @@ async fn restore_action(
     share_paths: Vec<String>,
     output_dir: String,
 ) -> Result<String, String> {
-    let _ = app.emit("status-msg", "Verifying & Restoring files...");
-
     if share_paths.is_empty() {
         return Err("No shares provided for restoration.".to_string());
     }
 
-    let mut key_share_data = Vec::new();
-    let mut headers: Vec<ShareHeader> = Vec::new();
-    let mut seen_indexes = HashSet::new();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = app.emit("status-msg", "Verifying & Restoring files...");
 
-    let mut bundle_id = [0u8; 16];
-    let mut base_nonce_prefix = [0u8; 16];
-    let mut threshold = 0u8;
-    let mut expected_total_shares = 0u8;
+        let mut key_share_data = Vec::new();
+        let mut headers: Vec<ShareHeader> = Vec::new();
+        let mut seen_indexes = HashSet::new();
 
-    let mut active_share_file: Option<File> = None;
+        let mut bundle_id = [0u8; 16];
+        let mut base_nonce_prefix = [0u8; 16];
+        let mut threshold = 0u8;
+        let mut expected_total_shares = 0u8;
 
-    let first_share_metadata = fs::metadata(&share_paths[0])
-        .map_err(|error| format!("Cannot inspect first share: {error}"))?;
-    let total_bytes = first_share_metadata.len();
+        let mut active_share_file: Option<File> = None;
 
-    for (index, path) in share_paths.iter().enumerate() {
-        let mut file =
-            File::open(path).map_err(|error| format!("Failed to open share {path}: {error}"))?;
+        let first_share_metadata = fs::metadata(&share_paths[0])
+            .map_err(|error| format!("Cannot inspect first share: {error}"))?;
+        let total_bytes = first_share_metadata.len();
 
-        let header = ShareHeader::read_from(&mut file)
-            .map_err(|error| format!("Invalid share header in {path}: {error}"))?;
+        for (index, path) in share_paths.iter().enumerate() {
+            let mut file = File::open(path)
+                .map_err(|error| format!("Failed to open share {path}: {error}"))?;
 
-        if !seen_indexes.insert(header.share_index) {
+            let header = ShareHeader::read_from(&mut file)
+                .map_err(|error| format!("Invalid share header in {path}: {error}"))?;
+
+            if !seen_indexes.insert(header.share_index) {
+                return Err(format!(
+                    "Duplicate share index detected: {}",
+                    header.share_index
+                ));
+            }
+
+            if index == 0 {
+                bundle_id = header.bundle_id;
+                base_nonce_prefix = header.base_nonce_prefix;
+                threshold = header.threshold;
+                expected_total_shares = header.total_shares;
+
+                active_share_file = Some(file);
+            } else if header.bundle_id != bundle_id
+                || header.threshold != threshold
+                || header.total_shares != expected_total_shares
+                || header.base_nonce_prefix != base_nonce_prefix
+            {
+                return Err("Share mismatch: files do not belong to the same bundle.".to_string());
+            }
+
+            key_share_data.push(header.ssss_share_data.clone());
+            headers.push(header);
+        }
+
+        if headers.len() < threshold as usize {
             return Err(format!(
-                "Duplicate share index detected: {}",
-                header.share_index
+                "Insufficient shares: received {}, but need at least {}.",
+                headers.len(),
+                threshold
             ));
         }
 
-        if index == 0 {
-            bundle_id = header.bundle_id;
-            base_nonce_prefix = header.base_nonce_prefix;
-            threshold = header.threshold;
-            expected_total_shares = header.total_shares;
+        let master_key: Zeroizing<[u8; 32]> = reconstruct_key(&key_share_data, threshold)
+            .map_err(|error| format!("Failed to reconstruct the master key: {error}"))?;
 
-            active_share_file = Some(file);
-        } else if header.bundle_id != bundle_id
-            || header.threshold != threshold
-            || header.total_shares != expected_total_shares
-            || header.base_nonce_prefix != base_nonce_prefix
-        {
-            return Err("Share mismatch: files do not belong to the same bundle.".to_string());
+        for header in &headers {
+            header.verify_auth(&master_key).map_err(|error| {
+                format!(
+                    "Share {} failed header authentication: {error}",
+                    header.share_index
+                )
+            })?;
         }
 
-        key_share_data.push(header.ssss_share_data.clone());
-        headers.push(header);
-    }
+        let target_dest = Path::new(&output_dir);
+        let share_file = active_share_file
+            .ok_or_else(|| "Could not open a share for restoration.".to_string())?;
 
-    if headers.len() < threshold as usize {
-        return Err(format!(
-            "Insufficient shares: received {}, but need at least {}.",
-            headers.len(),
-            threshold
-        ));
-    }
+        let progress_reader = ProgressReader {
+            inner: share_file,
+            app: &app,
+            total_bytes,
+            bytes_read: 0,
+            start_time: Instant::now(),
+            last_emit: Instant::now(),
+            event_name: "restore-progress",
+        };
 
-    let master_key: Zeroizing<[u8; 32]> = reconstruct_key(&key_share_data, threshold)
-        .map_err(|error| format!("Failed to reconstruct the master key: {error}"))?;
+        let restored_path = restore_pipeline(
+            progress_reader,
+            &master_key,
+            bundle_id,
+            base_nonce_prefix,
+            target_dest,
+        )
+        .map_err(|error| format!("Restoration failed: {error}"))?;
 
-    for header in &headers {
-        header.verify_auth(&master_key).map_err(|error| {
-            format!(
-                "Share {} failed header authentication: {error}",
-                header.share_index
-            )
-        })?;
-    }
+        let _ = app.emit(
+            "restore-progress",
+            ProgressPayload {
+                percent: 100.0,
+                eta_seconds: 0.0,
+            },
+        );
 
-    let target_dest = Path::new(&output_dir);
-    let share_file =
-        active_share_file.ok_or_else(|| "Could not open a share for restoration.".to_string())?;
-
-    let progress_reader = ProgressReader {
-        inner: share_file,
-        app: &app,
-        total_bytes,
-        bytes_read: 0,
-        start_time: Instant::now(),
-        last_emit: Instant::now(),
-        event_name: "restore-progress",
-    };
-
-    let restored_path = restore_pipeline(
-        progress_reader,
-        &master_key,
-        bundle_id,
-        base_nonce_prefix,
-        target_dest,
-    )
-    .map_err(|error| format!("Restoration failed: {error}"))?;
-
-    let _ = app.emit(
-        "restore-progress",
-        ProgressPayload {
-            percent: 100.0,
-            eta_seconds: 0.0,
-        },
-    );
-
-    Ok(format!(
-        "Success: Files restored to\n{}",
-        restored_path.display()
-    ))
+        Ok(format!(
+            "Success: Files restored to\n{}",
+            restored_path.display()
+        ))
+    })
+    .await
+    .map_err(|error| format!("Restoration worker failed: {error}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -697,6 +620,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             preview_split,
+            check_output_space,
             split_action,
             restore_action
         ])
@@ -718,7 +642,7 @@ mod tests {
 
         fs::create_dir_all(&output).unwrap();
 
-        let result = validate_split_paths(source.to_str().unwrap(), output.to_str().unwrap());
+        let result = validate_split_paths(source.to_str().unwrap(), output.to_str().unwrap(), 3);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("outside the source"));
