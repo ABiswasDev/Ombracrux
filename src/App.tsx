@@ -4,6 +4,28 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import "./App.css";
 
+interface PreflightPayload {
+  files_scanned: number;
+  dirs_scanned: number;
+  source_bytes: number;
+  shares_to_create: number;
+  estimated_share_bytes: number;
+  estimated_total_output_bytes: number;
+  available_output_bytes: number | null;
+  insufficient_space: boolean;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const index = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1
+  );
+  const value = bytes / Math.pow(1024, index);
+  return `${value >= 100 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+}
+
 function App() {
   const [tab, setTab] = useState<"split" | "restore">("split");
 
@@ -20,6 +42,10 @@ function App() {
   const [threshold, setThreshold] = useState(3);
   const [totalShares, setTotalShares] = useState(5);
   const [splitStatus, setSplitStatus] = useState("");
+
+  // Preflight Preview State
+  const [preflight, setPreflight] = useState<PreflightPayload | null>(null);
+  const [preflightError, setPreflightError] = useState("");
 
   // Restore State
   const [sharePaths, setSharePaths] = useState<string[]>([]);
@@ -46,6 +72,38 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!inputDir || totalShares < 2 || totalShares > 255) {
+      setPreflight(null);
+      setPreflightError("");
+      return;
+    }
+
+    let cancelled = false;
+
+    invoke<PreflightPayload>("preview_split", {
+      inputDir,
+      outputDir: outputDir || null,
+      totalShares,
+    })
+      .then((report) => {
+        if (!cancelled) {
+          setPreflight(report);
+          setPreflightError("");
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setPreflight(null);
+          setPreflightError(String(err));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [inputDir, outputDir, totalShares]);
+
   const handleTabChange = (nextTab: "split" | "restore") => {
     if (isProcessing) return;
     setTab(nextTab);
@@ -58,7 +116,11 @@ function App() {
 
   const handleSelectDir = async (setter: React.Dispatch<React.SetStateAction<string>>) => {
     const selected = await open({ directory: true });
-    if (selected && typeof selected === "string") setter(selected);
+    if (selected && typeof selected === "string") {
+      setter(selected);
+      setSplitStatus("");
+      setRestoreStatus("");
+    }
   };
 
   const handleSelectShares = async () => {
@@ -66,7 +128,10 @@ function App() {
       multiple: true,
       filters: [{ name: "Ombracrux Shares", extensions: ["ombracrx"] }],
     });
-    if (selected && Array.isArray(selected)) setSharePaths(selected);
+    if (selected && Array.isArray(selected)) {
+      setSharePaths(selected);
+      setRestoreStatus("");
+    }
   };
 
   const resetProgress = () => {
@@ -211,7 +276,65 @@ function App() {
             </div>
           </div>
 
-          <button className="primary-btn" onClick={handleSplit} disabled={isProcessing}>
+          {preflight && (
+            <div className={`preflight-card ${preflight.insufficient_space ? "warn-border" : ""}`}>
+              <div className="preflight-header">
+                <span className="preflight-title">Preflight Report</span>
+                {preflight.available_output_bytes !== null && (
+                  <span className="preflight-badge">
+                    Destination Free: {formatBytes(preflight.available_output_bytes)}
+                  </span>
+                )}
+              </div>
+              <div className="preflight-grid">
+                <div className="preflight-item">
+                  <span className="preflight-label">Files scanned</span>
+                  <span className="preflight-value">
+                    {preflight.files_scanned.toLocaleString()}
+                  </span>
+                </div>
+                <div className="preflight-item">
+                  <span className="preflight-label">Source data</span>
+                  <span className="preflight-value">
+                    {formatBytes(preflight.source_bytes)}
+                  </span>
+                </div>
+                <div className="preflight-item">
+                  <span className="preflight-label">Shares to create</span>
+                  <span className="preflight-value">{preflight.shares_to_create}</span>
+                </div>
+                <div className="preflight-item">
+                  <span className="preflight-label">Estimated total output</span>
+                  <span className="preflight-value">
+                    ~{formatBytes(preflight.estimated_total_output_bytes)}
+                  </span>
+                </div>
+              </div>
+
+              {preflight.insufficient_space && preflight.available_output_bytes !== null && (
+                <div className="preflight-warning">
+                  ⚠️ Insufficient destination space: requires ~
+                  {formatBytes(preflight.estimated_total_output_bytes)}, but only{" "}
+                  {formatBytes(preflight.available_output_bytes)} is free.
+                </div>
+              )}
+
+              <div className="preflight-note">
+                Includes in-memory TAR headers, 512B block alignment, and stream framing (~
+                {formatBytes(preflight.estimated_share_bytes)} per share).
+              </div>
+            </div>
+          )}
+
+          {preflightError && (
+            <div className="status-box error">Preflight Error: {preflightError}</div>
+          )}
+
+          <button
+            className="primary-btn"
+            onClick={handleSplit}
+            disabled={isProcessing || Boolean(preflight?.insufficient_space)}
+          >
             {isProcessing ? "Processing..." : "Create Secure Shares"}
           </button>
 
