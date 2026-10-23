@@ -405,4 +405,41 @@ mod tests {
         assert!(!html_text.contains("Confidential_Source_Dir_Name"));
         assert!(html_text.contains("Any 2 of 3 Shares"));
     }
+
+    #[test]
+    fn manifest_rejects_mixed_bundles_and_escapes_html_characters() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let out_a = temp.path().join("out_a");
+        let out_b = temp.path().join("out_b");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&out_a).unwrap();
+        fs::create_dir_all(&out_b).unwrap();
+        fs::write(src.join("data.txt"), b"vault payload").unwrap();
+
+        let paths_a: Vec<PathBuf> = (1..=2)
+            .map(|i| out_a.join(format!("A.part{i}.ombracrx")))
+            .collect();
+        let files_a: Vec<File> = paths_a.iter().map(|p| File::create(p).unwrap()).collect();
+        split_directory(&src, files_a, 2, 2).unwrap();
+
+        let paths_b: Vec<PathBuf> = (1..=2)
+            .map(|i| out_b.join(format!("B.part{i}.ombracrx")))
+            .collect();
+        let files_b: Vec<File> = paths_b.iter().map(|p| File::create(p).unwrap()).collect();
+        split_directory(&src, files_b, 2, 2).unwrap();
+
+        // Mixing Share #1 from Vault A and Share #2 from Vault B must fail
+        let mixed = vec![paths_a[0].clone(), paths_b[1].clone()];
+        assert!(build_manifest("MixedVault", &mixed).is_err());
+
+        // Special characters in vault name must be escaped in HTML and JSON output
+        let manifest = build_manifest("Vault_<script>&\"test\"", &paths_a).unwrap();
+        let html = render_recovery_card_html(&manifest);
+        let json = render_manifest_json(&manifest);
+
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;&amp;&quot;test&quot;"));
+        assert!(json.contains("Vault_<script>&\\\"test\\\""));
+    }
 }

@@ -354,4 +354,56 @@ mod tests {
 
         assert!(verify_payload_stream(&mut c0, &key, h0.bundle_id, h0.base_nonce_prefix).is_err());
     }
+    #[test]
+    fn dry_run_verify_rejects_trailing_bytes_after_final_record() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("file.txt"), b"authenticated payload").unwrap();
+
+        let mut buffers: Vec<Vec<u8>> = (0..2).map(|_| Vec::new()).collect();
+        let writers: Vec<&mut Vec<u8>> = buffers.iter_mut().collect();
+        split_directory(temp.path(), writers, 2, 2).unwrap();
+
+        // Append an extra unauthenticated byte after the final EOF frame
+        buffers[0].push(0x99);
+
+        let mut c0 = Cursor::new(&buffers[0]);
+        let mut c1 = Cursor::new(&buffers[1]);
+        let h0 = ShareHeader::read_from(&mut c0).unwrap();
+        let h1 = ShareHeader::read_from(&mut c1).unwrap();
+
+        let key =
+            reconstruct_key(&[h0.ssss_share_data.clone(), h1.ssss_share_data.clone()], 2).unwrap();
+
+        let err = verify_payload_stream(&mut c0, &key, h0.bundle_id, h0.base_nonce_prefix)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("trailing bytes"));
+    }
+
+    #[test]
+    fn dry_run_verify_rejects_truncated_share_stream() {
+        let temp = tempdir().unwrap();
+        fs::write(temp.path().join("file.txt"), b"authenticated payload").unwrap();
+
+        let mut buffers: Vec<Vec<u8>> = (0..2).map(|_| Vec::new()).collect();
+        let writers: Vec<&mut Vec<u8>> = buffers.iter_mut().collect();
+        split_directory(temp.path(), writers, 2, 2).unwrap();
+
+        // Truncate the final 20-byte authenticated EOF frame (4B length + 16B tag)
+        let truncated_len = buffers[0].len() - 20;
+        buffers[0].truncate(truncated_len);
+
+        let mut c0 = Cursor::new(&buffers[0]);
+        let mut c1 = Cursor::new(&buffers[1]);
+        let h0 = ShareHeader::read_from(&mut c0).unwrap();
+        let h1 = ShareHeader::read_from(&mut c1).unwrap();
+
+        let key =
+            reconstruct_key(&[h0.ssss_share_data.clone(), h1.ssss_share_data.clone()], 2).unwrap();
+
+        let err = verify_payload_stream(&mut c0, &key, h0.bundle_id, h0.base_nonce_prefix)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing authenticated final record"));
+    }
 }

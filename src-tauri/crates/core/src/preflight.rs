@@ -272,4 +272,39 @@ mod tests {
         let temp = tempdir().unwrap();
         assert!(scan_preflight(temp.path(), 0).is_err());
     }
+
+    #[test]
+    fn preflight_matches_actual_size_for_empty_entries_and_long_paths() {
+        let temp = tempdir().unwrap();
+
+        // 1. Empty directory
+        let empty_dir = temp.path().join("empty_folder");
+        fs::create_dir_all(&empty_dir).unwrap();
+
+        // 2. Empty (0-byte) file
+        fs::write(temp.path().join("empty.txt"), b"").unwrap();
+
+        // 3. Nested path exceeding 100 bytes to trigger GNU LongLink TAR headers
+        let long_dir = temp
+            .path()
+            .join(
+                "a_very_long_directory_name_segment_for_testing_gnu_tar_longlink_headers_part_one",
+            )
+            .join(
+                "a_very_long_directory_name_segment_for_testing_gnu_tar_longlink_headers_part_two",
+            );
+        fs::create_dir_all(&long_dir).unwrap();
+        fs::write(long_dir.join("deep_payload.bin"), vec![b'z'; 4096]).unwrap();
+
+        let report = scan_preflight(temp.path(), 2).unwrap();
+
+        let mut buffers: Vec<Vec<u8>> = (0..2).map(|_| Vec::new()).collect();
+        let writers: Vec<&mut Vec<u8>> = buffers.iter_mut().collect();
+
+        split_directory(temp.path(), writers, 2, 2).unwrap();
+
+        for buf in &buffers {
+            assert_eq!(report.estimated_share_bytes, buf.len() as u64);
+        }
+    }
 }
