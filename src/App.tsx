@@ -16,6 +16,16 @@ interface PreflightPayload {
   insufficient_space: boolean;
 }
 
+interface ShareInspectionPayload {
+  selected_count: number;
+  threshold: number;
+  total_shares: number;
+  share_indices: number[];
+  single_share_bytes: number;
+  total_verify_read_bytes: number;
+  meets_threshold: boolean;
+}
+
 const SHARE_HEADER_BYTES = 112;
 const STREAM_CHUNK_SIZE = 1024 * 1024;
 const CHUNK_FRAMING_OVERHEAD = 20;
@@ -52,6 +62,7 @@ function App() {
   const [outputDir, setOutputDir] = useState("");
   const [threshold, setThreshold] = useState(3);
   const [totalShares, setTotalShares] = useState(5);
+  const [exportManifest, setExportManifest] = useState(true);
   const [splitStatus, setSplitStatus] = useState("");
 
   // Preflight Preview State (scanned once per inputDir)
@@ -59,8 +70,10 @@ function App() {
   const [availableOutputBytes, setAvailableOutputBytes] = useState<number | null>(null);
   const [preflightError, setPreflightError] = useState("");
 
-  // Restore State
+  // Restore & Verify State
   const [sharePaths, setSharePaths] = useState<string[]>([]);
+  const [shareInspection, setShareInspection] = useState<ShareInspectionPayload | null>(null);
+  const [shareInspectError, setShareInspectError] = useState("");
   const [restoreOutputDir, setRestoreOutputDir] = useState("");
   const [restoreStatus, setRestoreStatus] = useState("");
 
@@ -146,6 +159,35 @@ function App() {
     };
   }, [outputDir]);
 
+  // Inspect selected share headers when `sharePaths` changes in the Restore tab.
+  useEffect(() => {
+    if (sharePaths.length === 0) {
+      setShareInspection(null);
+      setShareInspectError("");
+      return;
+    }
+
+    let cancelled = false;
+
+    invoke<ShareInspectionPayload>("inspect_shares", { sharePaths })
+      .then((info) => {
+        if (!cancelled) {
+          setShareInspection(info);
+          setShareInspectError("");
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setShareInspection(null);
+          setShareInspectError(String(err));
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [sharePaths]);
+
   // Recalculate share and total output arithmetic in O(1) memory when `totalShares` or `outputDir` changes.
   const preflight = useMemo<PreflightPayload | null>(() => {
     if (!baseScan || totalShares < 2 || totalShares > 255) {
@@ -220,10 +262,38 @@ function App() {
     resetProgress();
     setSplitStatus("");
     try {
-      await invoke("split_action", { inputDir, vaultName, outputDir, threshold, totalShares });
+      const result = await invoke<string>("split_action", {
+        inputDir,
+        vaultName,
+        outputDir,
+        threshold,
+        totalShares,
+        exportManifest,
+      });
+      setProcessMsg("");
+      setSplitStatus(result);
     } catch (err) {
       setProcessMsg("");
       setSplitStatus(`Error: ${err}`);
+    }
+    setIsProcessing(false);
+  };
+
+  const handleVerify = async () => {
+    if (sharePaths.length === 0) {
+      setProcessMsg("");
+      setRestoreStatus("Error: Please select share files to verify.");
+      return;
+    }
+    resetProgress();
+    setRestoreStatus("");
+    try {
+      const result = await invoke<string>("verify_action", { sharePaths });
+      setProcessMsg("");
+      setRestoreStatus(result);
+    } catch (err) {
+      setProcessMsg("");
+      setRestoreStatus(`Error: ${err}`);
     }
     setIsProcessing(false);
   };
@@ -385,10 +455,21 @@ function App() {
                 </div>
               )}
 
+              <div className="preflight-exclusions">
+                <label className="checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={exportManifest}
+                    onChange={(e) => setExportManifest(e.target.checked)}
+                    disabled={isProcessing}
+                  />
+                  Export SHA-256 manifest (.json) &amp; printable recovery card (.html)
+                </label>
+              </div>
+
               <div className="preflight-note">
                 Estimates (~{formatBytes(preflight.estimated_share_bytes)} per share) include TAR
-                headers, 512B alignment, and stream framing; actual size may vary slightly with
-                metadata.
+                headers, 512B alignment, and stream framing.
               </div>
             </div>
           )}
@@ -449,8 +530,60 @@ function App() {
             </div>
           </div>
 
+          {shareInspection && (
+            <div className={`preflight-card ${!shareInspection.meets_threshold ? "warn-border" : ""}`}>
+              <div className="preflight-header">
+                <span className="preflight-title">Share Set Check</span>
+                <span className="preflight-badge">
+                  Shares: #{shareInspection.share_indices.join(", #")}
+                </span>
+              </div>
+              <div className="preflight-grid">
+                <div className="preflight-item">
+                  <span className="preflight-label">Selected</span>
+                  <span className="preflight-value">{shareInspection.selected_count}</span>
+                </div>
+                <div className="preflight-item">
+                  <span className="preflight-label">Required (T of N)</span>
+                  <span className="preflight-value">
+                    {shareInspection.threshold} of {shareInspection.total_shares}
+                  </span>
+                </div>
+                <div className="preflight-item">
+                  <span className="preflight-label">Per-share size</span>
+                  <span className="preflight-value">
+                    {formatBytes(shareInspection.single_share_bytes)}
+                  </span>
+                </div>
+                <div className="preflight-item">
+                  <span className="preflight-label">Full verify read</span>
+                  <span className="preflight-value">
+                    {formatBytes(shareInspection.total_verify_read_bytes)}
+                  </span>
+                </div>
+              </div>
+
+              {!shareInspection.meets_threshold && (
+                <div className="preflight-warning">
+                  ⚠️ Insufficient shares: selected {shareInspection.selected_count}, but at least{" "}
+                  {shareInspection.threshold} are required to reconstruct the key.
+                </div>
+              )}
+
+              <div className="preflight-note">
+                Dry-run verification streams and authenticates all {shareInspection.selected_count}{" "}
+                selected share payloads ({formatBytes(shareInspection.total_verify_read_bytes)} total
+                read) in memory without writing to disk.
+              </div>
+            </div>
+          )}
+
+          {shareInspectError && (
+            <div className="status-box error">Share Set Error: {shareInspectError}</div>
+          )}
+
           <div className="input-group">
-            <label>Output Folder</label>
+            <label>Output Folder (Required for Unpack Only)</label>
             <div className="file-picker">
               <input
                 type="text"
@@ -464,9 +597,32 @@ function App() {
             </div>
           </div>
 
-          <button className="primary-btn" onClick={handleRestore} disabled={isProcessing}>
-            {isProcessing ? "Processing..." : "Recover & Unpack"}
-          </button>
+          <div className="row">
+            <button
+              className="secondary-btn"
+              onClick={handleVerify}
+              disabled={
+                isProcessing ||
+                sharePaths.length === 0 ||
+                Boolean(shareInspectError) ||
+                Boolean(shareInspection && !shareInspection.meets_threshold)
+              }
+            >
+              {isProcessing ? "Verifying..." : "Verify Shares (Dry Run)"}
+            </button>
+            <button
+              className="primary-btn"
+              onClick={handleRestore}
+              disabled={
+                isProcessing ||
+                sharePaths.length === 0 ||
+                Boolean(shareInspectError) ||
+                Boolean(shareInspection && !shareInspection.meets_threshold)
+              }
+            >
+              {isProcessing ? "Processing..." : "Recover & Unpack"}
+            </button>
+          </div>
 
           {processMsg && <div className="process-msg">{processMsg}</div>}
           {isProcessing && (

@@ -9,10 +9,12 @@ use tauri::{AppHandle, Emitter};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 
 use ombracrux_core::format::ShareHeader;
+use ombracrux_core::manifest::write_recovery_files;
 use ombracrux_core::preflight::{PreflightReport, scan_preflight};
 use ombracrux_core::restore::restore_pipeline;
 use ombracrux_core::shares::{Zeroizing, reconstruct_key};
 use ombracrux_core::split::split_directory;
+use ombracrux_core::verify::verify_payload_stream;
 
 #[derive(Clone, serde::Serialize)]
 struct ProgressPayload {
@@ -31,6 +33,17 @@ struct PreflightPayload {
     estimated_total_output_bytes: u64,
     available_output_bytes: Option<u64>,
     insufficient_space: bool,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ShareInspectionPayload {
+    selected_count: usize,
+    threshold: u8,
+    total_shares: u8,
+    share_indices: Vec<u8>,
+    single_share_bytes: u64,
+    total_verify_read_bytes: u64,
+    meets_threshold: bool,
 }
 
 /// Uses symlink_metadata so broken symlinks also count as existing paths.
@@ -162,6 +175,82 @@ async fn preview_split(
     })
     .await
     .map_err(|error| format!("Preflight scan task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn inspect_shares(share_paths: Vec<String>) -> Result<ShareInspectionPayload, String> {
+    if share_paths.is_empty() {
+        return Err("No shares selected.".to_string());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut bundle_id = [0u8; 16];
+        let mut base_nonce_prefix = [0u8; 16];
+        let mut threshold = 0u8;
+        let mut total_shares = 0u8;
+        let mut seen_indices = HashSet::new();
+        let mut share_indices = Vec::with_capacity(share_paths.len());
+        let mut single_share_bytes = 0u64;
+        let mut total_verify_read_bytes = 0u64;
+
+        for (idx, path) in share_paths.iter().enumerate() {
+            let meta =
+                fs::metadata(path).map_err(|e| format!("Cannot inspect share {path}: {e}"))?;
+            let file_len = meta.len();
+
+            if idx == 0 {
+                single_share_bytes = file_len;
+            }
+
+            total_verify_read_bytes = total_verify_read_bytes
+                .checked_add(file_len)
+                .ok_or_else(|| "Total share size overflow".to_string())?;
+
+            let mut file =
+                File::open(path).map_err(|e| format!("Failed to open share {path}: {e}"))?;
+            let header = ShareHeader::read_from(&mut file)
+                .map_err(|e| format!("Invalid share header in {path}: {e}"))?;
+
+            if !seen_indices.insert(header.share_index) {
+                return Err(format!(
+                    "Duplicate share index detected: #{}",
+                    header.share_index
+                ));
+            }
+
+            if idx == 0 {
+                bundle_id = header.bundle_id;
+                base_nonce_prefix = header.base_nonce_prefix;
+                threshold = header.threshold;
+                total_shares = header.total_shares;
+            } else if header.bundle_id != bundle_id
+                || header.threshold != threshold
+                || header.total_shares != total_shares
+                || header.base_nonce_prefix != base_nonce_prefix
+            {
+                return Err(
+                    "Share mismatch: selected files do not belong to the same bundle.".to_string(),
+                );
+            }
+
+            share_indices.push(header.share_index);
+        }
+
+        share_indices.sort_unstable();
+        let meets_threshold = share_paths.len() >= threshold as usize;
+
+        Ok(ShareInspectionPayload {
+            selected_count: share_paths.len(),
+            threshold,
+            total_shares,
+            share_indices,
+            single_share_bytes,
+            total_verify_read_bytes,
+            meets_threshold,
+        })
+    })
+    .await
+    .map_err(|error| format!("Share inspection failed: {error}"))?
 }
 
 /// Holds hidden temporary files until all encrypted shares are complete.
@@ -411,6 +500,7 @@ async fn split_action(
     output_dir: String,
     threshold: u8,
     total_shares: u8,
+    export_manifest: bool,
 ) -> Result<String, String> {
     if !valid_vault_name(&vault_name) {
         return Err(
@@ -455,11 +545,27 @@ async fn split_action(
             }
         }
 
+        if export_manifest {
+            for recovery_file in [
+                output_path.join(format!("{vault_name}.manifest.json")),
+                output_path.join(format!("{vault_name}.recovery-card.html")),
+            ] {
+                if path_entry_exists(&recovery_file)
+                    .map_err(|error| format!("Cannot inspect recovery output path: {error}"))?
+                {
+                    return Err(format!(
+                        "Recovery manifest file already exists. Nothing was overwritten: {}",
+                        recovery_file.display()
+                    ));
+                }
+            }
+        }
+
         let mut transaction = ShareOutputTransaction::new();
         let start_time = Instant::now();
         let mut output_files = Vec::with_capacity(total_shares as usize);
 
-        for (index, final_path) in final_paths.into_iter().enumerate() {
+        for (index, final_path) in final_paths.iter().cloned().enumerate() {
             let file = transaction.create_partial(&output_path, final_path)?;
 
             output_files.push(ProgressWriter {
@@ -478,6 +584,38 @@ async fn split_action(
 
         transaction.commit()?;
 
+        let mut completion_note = format!(
+            "Created {} encrypted shares in {}",
+            total_shares,
+            output_path.display()
+        );
+
+        if export_manifest {
+            let _ = app.emit(
+                "status-msg",
+                "Streaming SHA-256 checksums for recovery manifest & card...",
+            );
+            let generated = write_recovery_files(&output_path, &vault_name, &final_paths)
+                .map_err(|error| {
+                    format!("Shares were created, but manifest export failed: {error}")
+                })?;
+
+            completion_note = format!(
+                "Created {} shares + {}\nPrintable Card: {}",
+                total_shares,
+                generated
+                    .manifest_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("manifest.json"),
+                generated
+                    .html_card_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("recovery-card.html")
+            );
+        }
+
         let _ = app.emit(
             "split-progress",
             ProgressPayload {
@@ -486,10 +624,160 @@ async fn split_action(
             },
         );
         let _ = app.emit("status-msg", "Encryption has been finished.");
-        Ok("Split successful".to_string())
+        Ok(completion_note)
     })
     .await
     .map_err(|error| format!("Encryption worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn verify_action(app: AppHandle, share_paths: Vec<String>) -> Result<String, String> {
+    if share_paths.is_empty() {
+        return Err("No shares provided for verification.".to_string());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = app.emit("status-msg", "Reconstructing key & authenticating share headers...");
+
+        let mut key_share_data = Vec::new();
+        let mut headers: Vec<ShareHeader> = Vec::new();
+        let mut seen_indexes = HashSet::new();
+
+        let mut bundle_id = [0u8; 16];
+        let mut base_nonce_prefix = [0u8; 16];
+        let mut threshold = 0u8;
+        let mut expected_total_shares = 0u8;
+        let mut total_bytes_all_shares = 0u64;
+
+        for (index, path) in share_paths.iter().enumerate() {
+            let metadata = fs::metadata(path)
+                .map_err(|error| format!("Cannot inspect share {path}: {error}"))?;
+            total_bytes_all_shares = total_bytes_all_shares
+                .checked_add(metadata.len())
+                .ok_or_else(|| "Total verification byte size overflow".to_string())?;
+
+            let mut file = File::open(path)
+                .map_err(|error| format!("Failed to open share {path}: {error}"))?;
+
+            let header = ShareHeader::read_from(&mut file)
+                .map_err(|error| format!("Invalid share header in {path}: {error}"))?;
+
+            if !seen_indexes.insert(header.share_index) {
+                return Err(format!(
+                    "Duplicate share index detected: {}",
+                    header.share_index
+                ));
+            }
+
+            if index == 0 {
+                bundle_id = header.bundle_id;
+                base_nonce_prefix = header.base_nonce_prefix;
+                threshold = header.threshold;
+                expected_total_shares = header.total_shares;
+            } else if header.bundle_id != bundle_id
+                || header.threshold != threshold
+                || header.total_shares != expected_total_shares
+                || header.base_nonce_prefix != base_nonce_prefix
+            {
+                return Err("Share mismatch: files do not belong to the same bundle.".to_string());
+            }
+
+            key_share_data.push(header.ssss_share_data.clone());
+            headers.push(header);
+        }
+
+        if headers.len() < threshold as usize {
+            return Err(format!(
+                "Insufficient shares for threshold verification: selected {}, but need at least {}.",
+                headers.len(),
+                threshold
+            ));
+        }
+
+        let master_key: Zeroizing<[u8; 32]> = reconstruct_key(&key_share_data, threshold)
+            .map_err(|error| format!("Failed to reconstruct the master key: {error}"))?;
+
+        for header in &headers {
+            header.verify_auth(&master_key).map_err(|error| {
+                format!(
+                    "Share {} failed header HMAC authentication: {error}",
+                    header.share_index
+                )
+            })?;
+        }
+
+        let start_time = Instant::now();
+        let mut last_emit = Instant::now();
+        let mut cumulative_bytes_read = 0u64;
+        let mut last_report = None;
+
+        for (i, path) in share_paths.iter().enumerate() {
+            let _ = app.emit(
+                "status-msg",
+                format!(
+                    "Dry-run auditing share {} of {} (in-memory AEAD + TAR check)...",
+                    i + 1,
+                    share_paths.len()
+                ),
+            );
+
+            let mut file = File::open(path)
+                .map_err(|error| format!("Failed to reopen share {path}: {error}"))?;
+            let header = ShareHeader::read_from(&mut file)
+                .map_err(|error| format!("Invalid share header in {path}: {error}"))?;
+
+            let mut reader = ProgressReader {
+                inner: file,
+                app: &app,
+                total_bytes: total_bytes_all_shares,
+                bytes_read: cumulative_bytes_read,
+                start_time,
+                last_emit,
+                event_name: "restore-progress",
+            };
+
+            let report = verify_payload_stream(
+                &mut reader,
+                &master_key,
+                bundle_id,
+                base_nonce_prefix,
+            )
+            .map_err(|error| {
+                format!(
+                    "Share #{} ({path}) failed payload verification: {error}",
+                    header.share_index
+                )
+            })?;
+
+            cumulative_bytes_read = reader.bytes_read;
+            last_emit = reader.last_emit;
+            last_report = Some(report);
+        }
+
+        let _ = app.emit(
+            "restore-progress",
+            ProgressPayload {
+                percent: 100.0,
+                eta_seconds: 0.0,
+            },
+        );
+        let _ = app.emit("status-msg", "");
+
+        let summary = last_report.ok_or_else(|| "Verification produced no report.".to_string())?;
+
+        Ok(format!(
+            "Verified {} of {} shares (Threshold: {}) — 100% Intact.\nArchive contains {} files and {} folders ({} B plaintext across {} authenticated chunks). Zero files written to disk.",
+            share_paths.len(),
+            expected_total_shares,
+            threshold,
+            summary.files_verified,
+            summary.dirs_verified,
+            summary.plaintext_bytes_verified,
+            summary.chunks_verified
+        ))
+    })
+    .await
+    .map_err(|error| format!("Verification worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -621,7 +909,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             preview_split,
             check_output_space,
+            inspect_shares,
             split_action,
+            verify_action,
             restore_action
         ])
         .run(tauri::generate_context!())
