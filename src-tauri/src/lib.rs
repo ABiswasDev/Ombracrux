@@ -11,7 +11,7 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile};
 use ombracrux_core::format::ShareHeader;
 use ombracrux_core::manifest::write_recovery_files;
 use ombracrux_core::preflight::{PreflightReport, scan_preflight};
-use ombracrux_core::restore::restore_pipeline;
+use ombracrux_core::restore::restore_pipeline_classified;
 use ombracrux_core::shares::{Zeroizing, reconstruct_key};
 use ombracrux_core::split::split_directory;
 use ombracrux_core::verify::verify_payload_stream;
@@ -495,8 +495,8 @@ fn emit_progress(
 }
 
 /// Attempts payload restoration across all authenticated shares in order,
-/// automatically failing over to the next share if a share's payload stream
-/// is corrupted or truncated.
+/// failing over to the next share ONLY when a share's payload/archive stream
+/// is corrupted or unreadable, and aborting immediately on destination errors.
 fn restore_with_failover(
     app: Option<&AppHandle>,
     share_paths: &[String],
@@ -568,7 +568,7 @@ fn restore_with_failover(
             event_name: "restore-progress",
         };
 
-        match restore_pipeline(
+        match restore_pipeline_classified(
             progress_reader,
             master_key,
             bundle_id,
@@ -579,6 +579,9 @@ fn restore_with_failover(
                 return Ok((restored_path, header.share_index, attempt_idx));
             }
             Err(error) => {
+                if !error.is_recoverable_with_another_share() {
+                    return Err(format!("Restoration failed: {error}"));
+                }
                 failure_reasons.push(format!("Share #{}: {error}", header.share_index));
             }
         }
@@ -1204,5 +1207,199 @@ mod tests {
             fs::read(restored_path.join("important.txt")).unwrap(),
             b"resilient threshold data"
         );
+    }
+
+    #[test]
+    fn restore_fails_over_across_multiple_damaged_shares_and_cleans_staging() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let shares_dir = temp.path().join("shares");
+        let restore_dir = temp.path().join("restored");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&shares_dir).unwrap();
+        fs::create_dir_all(&restore_dir).unwrap();
+        fs::write(src.join("multi.txt"), b"survived two damaged shares").unwrap();
+
+        let share_paths_buf: Vec<PathBuf> = (1..=3)
+            .map(|i| shares_dir.join(format!("Vault.part{i}.ombracrx")))
+            .collect();
+        let files: Vec<File> = share_paths_buf
+            .iter()
+            .map(|p| File::create(p).unwrap())
+            .collect();
+
+        split_directory(&src, files, 2, 3).unwrap();
+
+        // 1. Truncate Share #1's payload stream
+        let mut s1 = fs::read(&share_paths_buf[0]).unwrap();
+        s1.truncate(s1.len() - 25);
+        fs::write(&share_paths_buf[0], &s1).unwrap();
+
+        // 2. Corrupt a ciphertext byte in Share #2
+        let mut s2 = fs::read(&share_paths_buf[1]).unwrap();
+        let idx = s2.len() - 6;
+        s2[idx] ^= 0xAA;
+        fs::write(&share_paths_buf[1], &s2).unwrap();
+
+        let share_strings: Vec<String> = share_paths_buf
+            .iter()
+            .map(|p| p.to_str().unwrap().to_string())
+            .collect();
+
+        let mut headers = Vec::new();
+        let mut key_shares = Vec::new();
+        for path in &share_paths_buf {
+            let mut f = File::open(path).unwrap();
+            let h = ShareHeader::read_from(&mut f).unwrap();
+            key_shares.push(h.ssss_share_data.clone());
+            headers.push(h);
+        }
+
+        let master_key = reconstruct_key(&key_shares, 2).unwrap();
+
+        let (restored_path, used_share_index, attempt_idx) = restore_with_failover(
+            None,
+            &share_strings,
+            &headers,
+            &master_key,
+            headers[0].bundle_id,
+            headers[0].base_nonce_prefix,
+            &restore_dir,
+        )
+        .unwrap();
+
+        assert_eq!(attempt_idx, 2);
+        assert_eq!(used_share_index, 3);
+        assert_eq!(
+            fs::read(restored_path.join("multi.txt")).unwrap(),
+            b"survived two damaged shares"
+        );
+        // Only the final restored folder should exist in restore_dir (zero leftover .tmp staging directories)
+        assert_eq!(fs::read_dir(&restore_dir).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn restore_leaves_no_staging_directories_when_all_shares_are_damaged() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let shares_dir = temp.path().join("shares");
+        let restore_dir = temp.path().join("restored");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&shares_dir).unwrap();
+        fs::create_dir_all(&restore_dir).unwrap();
+        fs::write(src.join("data.txt"), b"all shares will be damaged").unwrap();
+
+        let share_paths_buf: Vec<PathBuf> = (1..=2)
+            .map(|i| shares_dir.join(format!("Vault.part{i}.ombracrx")))
+            .collect();
+        let files: Vec<File> = share_paths_buf
+            .iter()
+            .map(|p| File::create(p).unwrap())
+            .collect();
+
+        split_directory(&src, files, 2, 2).unwrap();
+
+        // Corrupt both Share #1 and Share #2 payloads
+        for path in &share_paths_buf {
+            let mut bytes = fs::read(path).unwrap();
+            let last = bytes.len() - 4;
+            bytes[last] ^= 0x55;
+            fs::write(path, &bytes).unwrap();
+        }
+
+        let share_strings: Vec<String> = share_paths_buf
+            .iter()
+            .map(|p| p.to_str().unwrap().to_string())
+            .collect();
+
+        let mut headers = Vec::new();
+        let mut key_shares = Vec::new();
+        for path in &share_paths_buf {
+            let mut f = File::open(path).unwrap();
+            let h = ShareHeader::read_from(&mut f).unwrap();
+            key_shares.push(h.ssss_share_data.clone());
+            headers.push(h);
+        }
+
+        let master_key = reconstruct_key(&key_shares, 2).unwrap();
+
+        let err = restore_with_failover(
+            None,
+            &share_strings,
+            &headers,
+            &master_key,
+            headers[0].bundle_id,
+            headers[0].base_nonce_prefix,
+            &restore_dir,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("Restoration failed across all 2 selected shares"));
+        assert_eq!(fs::read_dir(&restore_dir).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_aborts_immediately_without_failover_on_destination_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let shares_dir = temp.path().join("shares");
+        let readonly_dest = temp.path().join("readonly_dest");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&shares_dir).unwrap();
+        fs::create_dir_all(&readonly_dest).unwrap();
+        fs::write(src.join("data.txt"), b"permission test").unwrap();
+
+        let share_paths_buf: Vec<PathBuf> = (1..=2)
+            .map(|i| shares_dir.join(format!("Vault.part{i}.ombracrx")))
+            .collect();
+        let files: Vec<File> = share_paths_buf
+            .iter()
+            .map(|p| File::create(p).unwrap())
+            .collect();
+
+        split_directory(&src, files, 2, 2).unwrap();
+
+        let share_strings: Vec<String> = share_paths_buf
+            .iter()
+            .map(|p| p.to_str().unwrap().to_string())
+            .collect();
+
+        let mut headers = Vec::new();
+        let mut key_shares = Vec::new();
+        for path in &share_paths_buf {
+            let mut f = File::open(path).unwrap();
+            let h = ShareHeader::read_from(&mut f).unwrap();
+            key_shares.push(h.ssss_share_data.clone());
+            headers.push(h);
+        }
+
+        let master_key = reconstruct_key(&key_shares, 2).unwrap();
+
+        // Make destination directory read-only so staging directory creation fails with PermissionDenied
+        fs::set_permissions(&readonly_dest, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = restore_with_failover(
+            None,
+            &share_strings,
+            &headers,
+            &master_key,
+            headers[0].bundle_id,
+            headers[0].base_nonce_prefix,
+            &readonly_dest,
+        )
+        .unwrap_err();
+
+        // Restore write permissions so tempdir cleanup succeeds
+        fs::set_permissions(&readonly_dest, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Must report Destination error directly rather than looping across all shares
+        assert!(
+            err.contains("Destination error"),
+            "Expected immediate Destination error, got: {err}"
+        );
+        assert!(!err.contains("across all 2 selected shares"));
     }
 }

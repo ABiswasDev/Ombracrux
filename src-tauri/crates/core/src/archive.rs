@@ -98,7 +98,18 @@ fn open_verified_regular_file(path: &Path) -> io::Result<File> {
         ));
     }
 
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc_o_nofollow())
+            .open(path)?
+    };
+
+    #[cfg(not(unix))]
     let file = File::open(path)?;
+
     let open_meta = file.metadata()?;
 
     if !open_meta.is_file() {
@@ -128,13 +139,25 @@ fn open_verified_regular_file(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
-fn append_directory_no_symlinks<W: Write>(
-    archive: &mut tar::Builder<W>,
-    root_dir: &Path,
-    current_dir: &Path,
-) -> io::Result<()> {
-    let dir_meta = fs::symlink_metadata(current_dir)?;
-    if dir_meta.file_type().is_symlink() {
+#[cfg(unix)]
+const fn libc_o_nofollow() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        0o400000
+    }
+    #[cfg(target_os = "macos")]
+    {
+        0x0100
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
+}
+
+fn read_verified_directory_entries(current_dir: &Path) -> io::Result<Vec<fs::DirEntry>> {
+    let pre_meta = fs::symlink_metadata(current_dir)?;
+    if pre_meta.file_type().is_symlink() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -143,7 +166,7 @@ fn append_directory_no_symlinks<W: Write>(
             ),
         ));
     }
-    if !dir_meta.is_dir() {
+    if !pre_meta.is_dir() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -153,9 +176,59 @@ fn append_directory_no_symlinks<W: Write>(
         ));
     }
 
+    #[cfg(unix)]
+    let dir_handle = {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc_o_nofollow())
+            .open(current_dir)?
+    };
+
     let mut entries: Vec<fs::DirEntry> =
         fs::read_dir(current_dir)?.collect::<io::Result<Vec<_>>>()?;
+
+    let post_meta = fs::symlink_metadata(current_dir)?;
+    if post_meta.file_type().is_symlink() || !post_meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Detected concurrent directory replacement during archiving: {}",
+                current_dir.display()
+            ),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let handle_meta = dir_handle.metadata()?;
+        if !handle_meta.is_dir()
+            || pre_meta.dev() != handle_meta.dev()
+            || pre_meta.ino() != handle_meta.ino()
+            || post_meta.dev() != handle_meta.dev()
+            || post_meta.ino() != handle_meta.ino()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Detected concurrent directory inode change during archiving: {}",
+                    current_dir.display()
+                ),
+            ));
+        }
+    }
+
     entries.sort_by_key(|entry| entry.file_name());
+    Ok(entries)
+}
+
+fn append_directory_no_symlinks<W: Write>(
+    archive: &mut tar::Builder<W>,
+    root_dir: &Path,
+    current_dir: &Path,
+) -> io::Result<()> {
+    let entries = read_verified_directory_entries(current_dir)?;
 
     for entry in entries {
         let entry_path = entry.path();
@@ -176,6 +249,16 @@ fn append_directory_no_symlinks<W: Write>(
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
         if file_type.is_dir() {
+            let sub_meta = fs::symlink_metadata(&entry_path)?;
+            if sub_meta.file_type().is_symlink() || !sub_meta.is_dir() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Subdirectory changed before archiving: {}",
+                        entry_path.display()
+                    ),
+                ));
+            }
             archive.append_dir(rel_path, &entry_path)?;
             append_directory_no_symlinks(archive, root_dir, &entry_path)?;
         } else if file_type.is_file() {
@@ -291,5 +374,33 @@ mod tests {
             !saw_end,
             "Archive stream must not emit End when a symlink is rejected"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_stream_rejects_symlinked_subdirectory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempdir().unwrap();
+        let external_dir = temp.path().join("external_dir");
+        let source = temp.path().join("source");
+        fs::create_dir_all(&external_dir).unwrap();
+        fs::create_dir_all(&source).unwrap();
+        fs::write(external_dir.join("outside.txt"), b"external data").unwrap();
+
+        symlink(&external_dir, source.join("linked_subdir")).unwrap();
+
+        let rx = stream_directory_to_memory(&source, 64 * 1024);
+
+        let mut saw_error = false;
+        while let Ok(msg) = rx.recv() {
+            if let ArchiveMessage::Error(err) = msg {
+                assert!(err.contains("Symlinks are not currently supported"));
+                saw_error = true;
+                break;
+            }
+        }
+
+        assert!(saw_error, "Expected symlinked subdirectory to be rejected");
     }
 }
