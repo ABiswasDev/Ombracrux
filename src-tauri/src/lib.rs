@@ -422,7 +422,7 @@ impl Write for ProgressWriter<'_> {
 
 struct ProgressReader<'a, R> {
     inner: R,
-    app: &'a AppHandle,
+    app: Option<&'a AppHandle>,
     total_bytes: u64,
     bytes_read: u64,
     start_time: Instant,
@@ -437,14 +437,16 @@ impl<R: Read> Read for ProgressReader<'_, R> {
         if count > 0 {
             self.bytes_read += count as u64;
 
-            emit_progress(
-                self.app,
-                self.event_name,
-                self.bytes_read,
-                self.total_bytes,
-                &mut self.last_emit,
-                &self.start_time,
-            );
+            if let Some(app) = self.app {
+                emit_progress(
+                    app,
+                    self.event_name,
+                    self.bytes_read,
+                    self.total_bytes,
+                    &mut self.last_emit,
+                    &self.start_time,
+                );
+            }
         }
 
         Ok(count)
@@ -490,6 +492,103 @@ fn emit_progress(
 
         *last_emit = Instant::now();
     }
+}
+
+/// Attempts payload restoration across all authenticated shares in order,
+/// automatically failing over to the next share if a share's payload stream
+/// is corrupted or truncated.
+fn restore_with_failover(
+    app: Option<&AppHandle>,
+    share_paths: &[String],
+    headers: &[ShareHeader],
+    master_key: &[u8; 32],
+    bundle_id: [u8; 16],
+    base_nonce_prefix: [u8; 16],
+    target_dest: &Path,
+) -> Result<(PathBuf, u8, usize), String> {
+    let dest_meta = fs::metadata(target_dest)
+        .map_err(|error| format!("Cannot access destination folder: {error}"))?;
+    if !dest_meta.is_dir() {
+        return Err("The output path must be an existing directory.".to_string());
+    }
+
+    let mut failure_reasons = Vec::new();
+
+    for (attempt_idx, (path, header)) in share_paths.iter().zip(headers.iter()).enumerate() {
+        if attempt_idx > 0 {
+            if let Some(app_handle) = app {
+                let _ = app_handle.emit(
+                    "status-msg",
+                    format!(
+                        "Share #{} payload failed; failing over to Share #{}...",
+                        headers[attempt_idx - 1].share_index,
+                        header.share_index
+                    ),
+                );
+            }
+        }
+
+        let file_meta = match fs::metadata(path) {
+            Ok(meta) => meta,
+            Err(error) => {
+                failure_reasons.push(format!(
+                    "Share #{}: cannot inspect share file ({error})",
+                    header.share_index
+                ));
+                continue;
+            }
+        };
+
+        let mut file = match File::open(path) {
+            Ok(file) => file,
+            Err(error) => {
+                failure_reasons.push(format!(
+                    "Share #{}: cannot reopen share file ({error})",
+                    header.share_index
+                ));
+                continue;
+            }
+        };
+
+        if let Err(error) = ShareHeader::read_from(&mut file) {
+            failure_reasons.push(format!(
+                "Share #{}: invalid header on reopen ({error})",
+                header.share_index
+            ));
+            continue;
+        }
+
+        let progress_reader = ProgressReader {
+            inner: file,
+            app,
+            total_bytes: file_meta.len(),
+            bytes_read: 0,
+            start_time: Instant::now(),
+            last_emit: Instant::now(),
+            event_name: "restore-progress",
+        };
+
+        match restore_pipeline(
+            progress_reader,
+            master_key,
+            bundle_id,
+            base_nonce_prefix,
+            target_dest,
+        ) {
+            Ok(restored_path) => {
+                return Ok((restored_path, header.share_index, attempt_idx));
+            }
+            Err(error) => {
+                failure_reasons.push(format!("Share #{}: {error}", header.share_index));
+            }
+        }
+    }
+
+    Err(format!(
+        "Restoration failed across all {} selected shares ({})",
+        share_paths.len(),
+        failure_reasons.join("; ")
+    ))
 }
 
 #[tauri::command]
@@ -595,25 +694,31 @@ async fn split_action(
                 "status-msg",
                 "Streaming SHA-256 checksums for recovery manifest & card...",
             );
-            let generated = write_recovery_files(&output_path, &vault_name, &final_paths)
-                .map_err(|error| {
-                    format!("Shares were created, but manifest export failed: {error}")
-                })?;
-
-            completion_note = format!(
-                "Created {} shares + {}\nPrintable Card: {}",
-                total_shares,
-                generated
-                    .manifest_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("manifest.json"),
-                generated
-                    .html_card_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("recovery-card.html")
-            );
+            match write_recovery_files(&output_path, &vault_name, &final_paths) {
+                Ok(generated) => {
+                    completion_note = format!(
+                        "Created {} shares + {}\nPrintable Card: {}",
+                        total_shares,
+                        generated
+                            .manifest_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("manifest.json"),
+                        generated
+                            .html_card_path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("recovery-card.html")
+                    );
+                }
+                Err(error) => {
+                    completion_note = format!(
+                        "Created {} encrypted shares in {}.\nWarning: Optional manifest/recovery card export failed ({error}). Your encrypted shares are intact.",
+                        total_shares,
+                        output_path.display()
+                    );
+                }
+            }
         }
 
         let _ = app.emit(
@@ -715,7 +820,7 @@ async fn verify_action(app: AppHandle, share_paths: Vec<String>) -> Result<Strin
             let _ = app.emit(
                 "status-msg",
                 format!(
-                    "Dry-run auditing share {} of {} (in-memory AEAD + TAR check)...",
+                    "Verifying share {} of {} (in-memory AEAD + TAR check)...",
                     i + 1,
                     share_paths.len()
                 ),
@@ -728,7 +833,7 @@ async fn verify_action(app: AppHandle, share_paths: Vec<String>) -> Result<Strin
 
             let mut reader = ProgressReader {
                 inner: file,
-                app: &app,
+                app: Some(&app),
                 total_bytes: total_bytes_all_shares,
                 bytes_read: cumulative_bytes_read,
                 start_time,
@@ -802,12 +907,6 @@ async fn restore_action(
         let mut threshold = 0u8;
         let mut expected_total_shares = 0u8;
 
-        let mut active_share_file: Option<File> = None;
-
-        let first_share_metadata = fs::metadata(&share_paths[0])
-            .map_err(|error| format!("Cannot inspect first share: {error}"))?;
-        let total_bytes = first_share_metadata.len();
-
         for (index, path) in share_paths.iter().enumerate() {
             let mut file = File::open(path)
                 .map_err(|error| format!("Failed to open share {path}: {error}"))?;
@@ -827,8 +926,6 @@ async fn restore_action(
                 base_nonce_prefix = header.base_nonce_prefix;
                 threshold = header.threshold;
                 expected_total_shares = header.total_shares;
-
-                active_share_file = Some(file);
             } else if header.bundle_id != bundle_id
                 || header.threshold != threshold
                 || header.total_shares != expected_total_shares
@@ -862,27 +959,15 @@ async fn restore_action(
         }
 
         let target_dest = Path::new(&output_dir);
-        let share_file = active_share_file
-            .ok_or_else(|| "Could not open a share for restoration.".to_string())?;
-
-        let progress_reader = ProgressReader {
-            inner: share_file,
-            app: &app,
-            total_bytes,
-            bytes_read: 0,
-            start_time: Instant::now(),
-            last_emit: Instant::now(),
-            event_name: "restore-progress",
-        };
-
-        let restored_path = restore_pipeline(
-            progress_reader,
+        let (restored_path, used_share_index, attempt_idx) = restore_with_failover(
+            Some(&app),
+            &share_paths,
+            &headers,
             &master_key,
             bundle_id,
             base_nonce_prefix,
             target_dest,
-        )
-        .map_err(|error| format!("Restoration failed: {error}"))?;
+        )?;
 
         let _ = app.emit(
             "restore-progress",
@@ -891,11 +976,20 @@ async fn restore_action(
                 eta_seconds: 0.0,
             },
         );
+        let _ = app.emit("status-msg", "");
 
-        Ok(format!(
-            "Success: Files restored to\n{}",
-            restored_path.display()
-        ))
+        if attempt_idx > 0 {
+            Ok(format!(
+                "Success (recovered via Share #{} after earlier share payload error): Files restored to\n{}",
+                used_share_index,
+                restored_path.display()
+            ))
+        } else {
+            Ok(format!(
+                "Success: Files restored to\n{}",
+                restored_path.display()
+            ))
+        }
     })
     .await
     .map_err(|error| format!("Restoration worker failed: {error}"))?
@@ -1045,5 +1139,70 @@ mod tests {
         assert!(!final_one.exists());
         assert!(!final_two.exists());
         assert_eq!(fs::read_dir(output).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn restore_fails_over_to_next_share_when_first_payload_is_corrupted() {
+        let temp = tempdir().unwrap();
+        let src = temp.path().join("src");
+        let shares_dir = temp.path().join("shares");
+        let restore_dir = temp.path().join("restored");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&shares_dir).unwrap();
+        fs::create_dir_all(&restore_dir).unwrap();
+        fs::write(src.join("important.txt"), b"resilient threshold data").unwrap();
+
+        let share_paths_buf: Vec<PathBuf> = (1..=2)
+            .map(|i| shares_dir.join(format!("Vault.part{i}.ombracrx")))
+            .collect();
+        let files: Vec<File> = share_paths_buf
+            .iter()
+            .map(|p| File::create(p).unwrap())
+            .collect();
+
+        split_directory(&src, files, 2, 2).unwrap();
+
+        // Corrupt the encrypted payload body of Share #1 while leaving its header intact
+        let mut share1_bytes = fs::read(&share_paths_buf[0]).unwrap();
+        let last_idx = share1_bytes.len() - 5;
+        share1_bytes[last_idx] ^= 0xFF;
+        fs::write(&share_paths_buf[0], &share1_bytes).unwrap();
+
+        let share_strings: Vec<String> = share_paths_buf
+            .iter()
+            .map(|p| p.to_str().unwrap().to_string())
+            .collect();
+
+        let mut headers = Vec::new();
+        let mut key_shares = Vec::new();
+        for path in &share_paths_buf {
+            let mut f = File::open(path).unwrap();
+            let h = ShareHeader::read_from(&mut f).unwrap();
+            key_shares.push(h.ssss_share_data.clone());
+            headers.push(h);
+        }
+
+        let master_key = reconstruct_key(&key_shares, 2).unwrap();
+        for h in &headers {
+            h.verify_auth(&master_key).unwrap();
+        }
+
+        let (restored_path, used_share_index, attempt_idx) = restore_with_failover(
+            None,
+            &share_strings,
+            &headers,
+            &master_key,
+            headers[0].bundle_id,
+            headers[0].base_nonce_prefix,
+            &restore_dir,
+        )
+        .unwrap();
+
+        assert_eq!(attempt_idx, 1);
+        assert_eq!(used_share_index, 2);
+        assert_eq!(
+            fs::read(restored_path.join("important.txt")).unwrap(),
+            b"resilient threshold data"
+        );
     }
 }

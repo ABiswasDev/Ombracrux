@@ -293,11 +293,15 @@ pub fn verify_payload_stream<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archive::ArchiveMessage;
+    use crate::crypto::encrypt_pipeline;
     use crate::format::ShareHeader;
     use crate::shares::reconstruct_key;
     use crate::split::split_directory;
+    use byteorder::WriteBytesExt;
     use std::fs;
     use std::io::Cursor;
+    use std::sync::mpsc::sync_channel;
     use tempfile::tempdir;
 
     #[test]
@@ -354,6 +358,7 @@ mod tests {
 
         assert!(verify_payload_stream(&mut c0, &key, h0.bundle_id, h0.base_nonce_prefix).is_err());
     }
+
     #[test]
     fn dry_run_verify_rejects_trailing_bytes_after_final_record() {
         let temp = tempdir().unwrap();
@@ -405,5 +410,122 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing authenticated final record"));
+    }
+
+    #[test]
+    fn dry_run_verify_rejects_malformed_frame_lengths() {
+        let key = [0x11u8; 32];
+        let bundle_id = [0x22u8; 16];
+        let nonce_prefix = [0x33u8; 16];
+
+        // 1. Frame length smaller than AEAD_TAG_SIZE (16 bytes)
+        let mut undersized_stream = Vec::new();
+        undersized_stream.write_u32::<BigEndian>(8).unwrap();
+        undersized_stream.extend_from_slice(&[0u8; 8]);
+
+        let err_small = verify_payload_stream(
+            Cursor::new(&undersized_stream),
+            &key,
+            bundle_id,
+            nonce_prefix,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err_small.contains("Invalid encrypted frame size"));
+
+        // 2. Frame length larger than CHUNK_SIZE + AEAD_TAG_SIZE (1 MiB + 16 bytes)
+        let mut oversized_stream = Vec::new();
+        oversized_stream
+            .write_u32::<BigEndian>((CHUNK_SIZE + AEAD_TAG_SIZE + 1) as u32)
+            .unwrap();
+
+        let err_large = verify_payload_stream(
+            Cursor::new(&oversized_stream),
+            &key,
+            bundle_id,
+            nonce_prefix,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err_large.contains("Invalid encrypted frame size"));
+    }
+
+    #[test]
+    fn dry_run_verify_rejects_path_traversal_and_symlink_tar_entries() {
+        let key = [0x44u8; 32];
+        let bundle_id = [0x55u8; 16];
+        let nonce_prefix = [0x66u8; 16];
+
+        // Case 1: Encrypted TAR stream containing a `../escape.txt` traversal entry
+        let mut traversal_tar = Vec::new();
+        let mut bad_header = tar::Header::new_gnu();
+        bad_header.set_size(0);
+        bad_header.set_entry_type(tar::EntryType::Regular);
+        bad_header.set_mode(0o644);
+        bad_header.as_gnu_mut().unwrap().name[..13].copy_from_slice(b"../escape.txt");
+        bad_header.set_cksum();
+        traversal_tar.extend_from_slice(bad_header.as_bytes());
+        traversal_tar.extend_from_slice(&[0u8; 1024]); // TAR EOF blocks
+
+        let (tx1, rx1) = sync_channel(2);
+        tx1.send(ArchiveMessage::Chunk(traversal_tar)).unwrap();
+        tx1.send(ArchiveMessage::End).unwrap();
+        drop(tx1);
+
+        let mut encrypted_traversal = Vec::new();
+        encrypt_pipeline(
+            rx1,
+            vec![&mut encrypted_traversal],
+            &key,
+            bundle_id,
+            nonce_prefix,
+        )
+        .unwrap();
+
+        let err_traversal = verify_payload_stream(
+            Cursor::new(&encrypted_traversal),
+            &key,
+            bundle_id,
+            nonce_prefix,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err_traversal.contains("Unsafe archive entry path"));
+
+        // Case 2: Encrypted TAR stream containing an unsupported Symlink TAR entry
+        let mut symlink_tar = Vec::new();
+        let mut sym_header = tar::Header::new_gnu();
+        sym_header.set_path("injected_symlink").unwrap();
+        sym_header.set_size(0);
+        sym_header.set_entry_type(tar::EntryType::Symlink);
+        sym_header.set_mode(0o777);
+        sym_header.set_cksum();
+        symlink_tar.extend_from_slice(sym_header.as_bytes());
+        symlink_tar.extend_from_slice(&[0u8; 1024]); // TAR EOF blocks
+
+        let (tx2, rx2) = sync_channel(2);
+        tx2.send(ArchiveMessage::Chunk(symlink_tar)).unwrap();
+        tx2.send(ArchiveMessage::End).unwrap();
+        drop(tx2);
+
+        let mut encrypted_symlink = Vec::new();
+        encrypt_pipeline(
+            rx2,
+            vec![&mut encrypted_symlink],
+            &key,
+            bundle_id,
+            nonce_prefix,
+        )
+        .unwrap();
+
+        let err_symlink = verify_payload_stream(
+            Cursor::new(&encrypted_symlink),
+            &key,
+            bundle_id,
+            nonce_prefix,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err_symlink.contains("Unsupported TAR entry type"));
     }
 }
