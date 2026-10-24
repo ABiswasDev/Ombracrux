@@ -1,6 +1,6 @@
 {
   "productName": "Ombracrux",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "identifier": "com.ombraveil.ombracrux",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -11,7 +11,7 @@
   "app": {
     "windows": [
       {
-        "title": "Ombracrux 0.2.0",
+        "title": "Ombracrux 0.3.0",
         "width": 680,
         "height": 750,
         "resizable": false,

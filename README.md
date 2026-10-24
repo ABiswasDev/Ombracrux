@@ -37,6 +37,18 @@ To unlock and restore the original folder, a user-defined minimum number of shar
 
 ---
 
+## Download & Release Status
+
+Download pre-built desktop installers from the **[GitHub Releases Page](https://github.com/ABiswasDev/Ombracrux/releases)**:
+
+* **Linux:** `.deb`, `.rpm`, or `.AppImage`
+* **Windows:** `.msi` or `.exe` installer (64-bit)
+* **macOS:** `.dmg` disk image
+
+> **Release Note:** Active development happens on the `main` branch. If new features or hardening updates have been merged after the latest tagged release, build from `main` or wait for the next tagged release installer to access the newest capabilities.
+
+---
+
 ## User Guide
 
 You do not need a background in cryptography to use Ombracrux. Think of Ombracrux as a digital vault whose key is shattered into multiple pieces (**Shares**).
@@ -56,6 +68,8 @@ You do not need a background in cryptography to use Ombracrux. Think of Ombracru
 | **2-of-3** | 1 | 2 | Personal backup across 3 separate drives or locations |
 | **3-of-5** | 2 | 3 | Balanced long-term archival across multiple physical sites |
 | **4-of-7** | 3 | 4 | High-security cold storage distributed among multiple custodians |
+
+*Worked Example:* The number of shares you can afford to lose is always **$N - T$**. For example, in a **3-of-5** vault ($N = 5, T = 3$), you can lose up to **$5 - 3 = 2$ shares** and still recover your folder using the remaining **3 shares**.
 
 *Higher thresholds ($T$) require an attacker to compromise more locations, but also require you to keep at least $T$ shares intact and accessible. Note: Setting **Threshold ($T$) = 1** (`1-of-N`) provides redundancy against drive loss, but offers **no multi-share secrecy** because any single share can unlock the vault on its own.*
 
@@ -143,6 +157,8 @@ While sharing the conceptual workflow of threshold secret recovery, Ombracrux us
 
 ## Threat Models Ombracrux Deals With
 
+> **Key Operational Summary:** Successful recovery always requires **at least $T$ compatible shares with valid headers** AND **at least one intact encrypted payload stream** among your selected shares. Ombracrux is designed for trusted local endpoints and has not undergone an independent cryptographic security audit.
+
 Ombracrux is engineered to protect data at rest against specific physical, operational, and cryptographic risks:
 
 ### 1. Single-Point Physical Seizure or Device Theft
@@ -200,16 +216,6 @@ Ombracrux splits the **256-bit encryption key** into Shamir fragments, while **d
 
 ---
 
-## Download & Installation
-
-Download the latest installers from the [Releases Page](https://github.com/ABiswasDev/Ombracrux/releases):
-
-* **Linux:** `.deb`, `.rpm`, or `.AppImage`
-* **Windows:** `.msi` or `.exe` installer
-* **macOS:** `.dmg` disk image
-
----
-
 ## Developer Guide: Building & Testing from Source
 
 Ombracrux uses a Tauri workspace connecting a React/TypeScript frontend with the `ombracrux-core` Rust crate.
@@ -218,10 +224,11 @@ Ombracrux uses a Tauri workspace connecting a React/TypeScript frontend with the
 * **Node.js:** v20+ (CI builds with Node.js v24) and `npm`
 * **Rust:** Stable toolchain (`rustup`, `cargo`, `rustfmt`)
 * **Linux System Dependencies (Ubuntu / Mint / Debian):**
-  ```bash
-  sudo apt update
-  sudo apt install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libglib2.0-dev
-  
+```bash
+sudo apt update
+sudo apt install -y libwebkit2gtk-4.1-dev libgtk-3-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libglib2.0-dev
+```
+
 ### 2. Local Development
 ```bash
 git clone https://github.com/ABiswasDev/Ombracrux.git
@@ -231,9 +238,7 @@ npm run tauri dev
 ```
 
 ### 3. Running Automated Checks & Tests
-Ombracrux includes 37 Rust unit and integration tests across ombracrux-core, ombracrux_lib, and tests/streaming.rs. Covered areas include Shamir key splitting and reconstruction, HMAC-SHA256 header authentication, byte-exact preflight size estimation (including empty entries and GNU LongLink paths), recovery manifest and HTML escaping, in-memory stream verification (including corrupted bytes, trailing bytes, truncation, malformed frame lengths, and malicious TAR traversal/symlink entries), transactional share rollback, symlink/reparse-point rejection, and multi-share restoration failover with staging cleanup.
-
-Run formatting, compilation, and the workspace test suite locally before submitting changes:
+Ombracrux includes 37 Rust unit and integration tests across `ombracrux-core`, `ombracrux_lib`, and `tests/streaming.rs`. Covered areas include Shamir key splitting and reconstruction, `HMAC-SHA256` header authentication, byte-exact preflight size estimation (including empty entries and GNU `LongLink` paths), recovery manifest and HTML escaping, in-memory stream verification (including corrupted bytes, trailing bytes, truncation, malformed frame lengths, and malicious TAR traversal/symlink entries), transactional share rollback, symlink/reparse-point rejection, and multi-share restoration failover with staging cleanup.
 
 All formatting, workspace compilation, and automated unit/integration tests are executed from `src-tauri`:
 ```bash
@@ -242,6 +247,7 @@ cargo fmt --all -- --check
 cargo check --workspace
 cargo test --workspace
 ```
+*Note: Passing automated tests demonstrates that the covered test cases behave as expected; it does not constitute an independent cryptographic audit or prove the absence of security vulnerabilities.*
 
 ### 4. Building Production Installers
 ```bash
@@ -314,5 +320,5 @@ Required Notice: Copyright (c) 2026 Abhishek Biswas (https://github.com/ABiswasD
 ### Trademark & Branding Policy
 The names **"Ombracrux"**, a part of **"Ombraveil"** Research entity, and all associated logos, emblems, and visual identifiers are proprietary trademarks of **Abhishek Biswas**. While the source code is made available under the PolyForm Noncommercial License 1.0.0, **no license or right to use these trademarks is granted**:
 
-* **No Rebranding as Official Releases:** You may not distribute modified versions or forks of this software under the names "Ombracrux", or "Ombraveil", or use confusingly similar names or logos that imply endorsement by or affiliation with **Abhishek Biswas**(https://www.linkedin.com/in/abby33459/).
+* **No Rebranding as Official Releases:** You may not distribute modified versions or forks of this software under the names "Ombracrux", or "Ombraveil", or use confusingly similar names or logos that imply endorsement by or affiliation with [**Abhishek Biswas**](https://www.linkedin.com/in/abby33459/).
 * **Attribution Required on Forks:** Any permitted non-commercial fork or modified redistribution must retain the `Required Notice` above and clearly state that it is an unofficial modification.
