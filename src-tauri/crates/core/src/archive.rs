@@ -77,6 +77,29 @@ impl Write for ChannelWriter {
     }
 }
 
+#[cfg(unix)]
+const fn libc_o_nofollow() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        0o400000
+    }
+    #[cfg(target_os = "macos")]
+    {
+        0x0100
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
+}
+
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
 fn open_verified_regular_file(path: &Path) -> io::Result<File> {
     let sym_meta = fs::symlink_metadata(path)?;
     if sym_meta.file_type().is_symlink() {
@@ -107,12 +130,21 @@ fn open_verified_regular_file(path: &Path) -> io::Result<File> {
             .open(path)?
     };
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?
+    };
+
+    #[cfg(not(any(unix, windows)))]
     let file = File::open(path)?;
 
     let open_meta = file.metadata()?;
 
-    if !open_meta.is_file() {
+    if open_meta.file_type().is_symlink() || !open_meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!(
@@ -136,23 +168,26 @@ fn open_verified_regular_file(path: &Path) -> io::Result<File> {
         }
     }
 
-    Ok(file)
-}
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let is_reparse = (open_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        if is_reparse
+            || sym_meta.creation_time() != open_meta.creation_time()
+            || sym_meta.last_write_time() != open_meta.last_write_time()
+            || sym_meta.file_size() != open_meta.file_size()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Detected concurrent file or reparse-point replacement during archiving: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
 
-#[cfg(unix)]
-const fn libc_o_nofollow() -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        0o400000
-    }
-    #[cfg(target_os = "macos")]
-    {
-        0x0100
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        0
-    }
+    Ok(file)
 }
 
 fn read_verified_directory_entries(current_dir: &Path) -> io::Result<Vec<fs::DirEntry>> {
@@ -185,6 +220,15 @@ fn read_verified_directory_entries(current_dir: &Path) -> io::Result<Vec<fs::Dir
             .open(current_dir)?
     };
 
+    #[cfg(windows)]
+    let dir_handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(current_dir)?
+    };
+
     let mut entries: Vec<fs::DirEntry> =
         fs::read_dir(current_dir)?.collect::<io::Result<Vec<_>>>()?;
 
@@ -213,6 +257,26 @@ fn read_verified_directory_entries(current_dir: &Path) -> io::Result<Vec<fs::Dir
                 io::ErrorKind::InvalidInput,
                 format!(
                     "Detected concurrent directory inode change during archiving: {}",
+                    current_dir.display()
+                ),
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        let handle_meta = dir_handle.metadata()?;
+        let is_reparse = (handle_meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        if is_reparse
+            || !handle_meta.is_dir()
+            || pre_meta.creation_time() != handle_meta.creation_time()
+            || post_meta.creation_time() != handle_meta.creation_time()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Detected concurrent directory or reparse-point change during archiving: {}",
                     current_dir.display()
                 ),
             ));
